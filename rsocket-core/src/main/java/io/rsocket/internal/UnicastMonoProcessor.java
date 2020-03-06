@@ -35,34 +35,10 @@ import reactor.util.annotation.NonNull;
 import reactor.util.annotation.Nullable;
 import reactor.util.context.Context;
 
-public class UnicastMonoProcessor<O> extends Mono<O>
+import javax.annotation.Nonnull;
+
+public abstract class UnicastMonoProcessor<O> extends Mono<O>
     implements Processor<O, O>, CoreSubscriber<O>, Disposable, Subscription, Scannable {
-
-  static final MonoLifecycleHandler DEFAULT_LIFECYCLE = new MonoLifecycleHandler() {};
-
-  /**
-   * Create a {@link UnicastMonoProcessor} that will eagerly request 1 on {@link
-   * #onSubscribe(Subscription)}, cache and emit the eventual result for a single subscriber.
-   *
-   * @param <T> type of the expected value
-   * @return A {@link UnicastMonoProcessor}.
-   */
-  @SuppressWarnings("unchecked")
-  public static <T> UnicastMonoProcessor<T> create() {
-    return new UnicastMonoProcessor<T>(DEFAULT_LIFECYCLE);
-  }
-
-  /**
-   * Create a {@link UnicastMonoProcessor} that will eagerly request 1 on {@link
-   * #onSubscribe(Subscription)}, cache and emit the eventual result for a single subscriber.
-   *
-   * @param lifecycleHandler lifecycle handler
-   * @param <T> type of the expected value
-   * @return A {@link UnicastMonoProcessor}.
-   */
-  public static <T> UnicastMonoProcessor<T> create(MonoLifecycleHandler<T> lifecycleHandler) {
-    return new UnicastMonoProcessor<>(lifecycleHandler);
-  }
 
   /** Indicates this Subscription has no value and not requested yet. */
   static final int NO_SUBSCRIBER_NO_RESULT = 0;
@@ -103,11 +79,18 @@ public class UnicastMonoProcessor<O> extends Mono<O>
   Throwable error;
   O value;
 
-  final MonoLifecycleHandler<O> lifecycleHandler;
 
-  UnicastMonoProcessor(MonoLifecycleHandler<O> lifecycleHandler) {
-    this.lifecycleHandler = lifecycleHandler;
-  }
+  abstract void doOnSubscribe();
+
+  /**
+   * Handler which is invoked on the terminal activity within a given Monoø
+   *
+   * @param signalType a type of signal which explain what happened
+   * @param element an carried element. May not be present if stream is empty or cancelled or
+   *     errored
+   * @param e an carried error. May not be present if stream is cancelled or completed successfully
+   */
+  abstract void doOnTerminal(@Nonnull SignalType signalType, @javax.annotation.Nullable O element, @javax.annotation.Nullable Throwable e);
 
   @Override
   @NonNull
@@ -187,7 +170,7 @@ public class UnicastMonoProcessor<O> extends Mono<O>
           final Subscriber<? super O> a = actual;
           actual = null;
           value = null;
-          lifecycleHandler.doOnTerminal(SignalType.ON_COMPLETE, v, null);
+          this.doOnTerminal(SignalType.ON_COMPLETE, v, null);
           a.onNext(v);
           a.onComplete();
           return;
@@ -223,7 +206,7 @@ public class UnicastMonoProcessor<O> extends Mono<O>
         if (STATE.compareAndSet(this, state, HAS_REQUEST_HAS_RESULT)) {
           final Subscriber<? super O> a = actual;
           actual = null;
-          lifecycleHandler.doOnTerminal(SignalType.ON_COMPLETE, null, null);
+          this.doOnTerminal(SignalType.ON_COMPLETE, null, null);
           a.onComplete();
           return;
         }
@@ -257,7 +240,7 @@ public class UnicastMonoProcessor<O> extends Mono<O>
         if (STATE.compareAndSet(this, state, HAS_REQUEST_HAS_RESULT)) {
           final Subscriber<? super O> a = actual;
           actual = null;
-          lifecycleHandler.doOnTerminal(SignalType.ON_ERROR, null, e);
+          this.doOnTerminal(SignalType.ON_ERROR, null, e);
           a.onError(e);
           return;
         }
@@ -274,9 +257,7 @@ public class UnicastMonoProcessor<O> extends Mono<O>
     Objects.requireNonNull(actual, "subscribe");
 
     if (once == 0 && ONCE.compareAndSet(this, 0, 1)) {
-      final MonoLifecycleHandler<O> lh = this.lifecycleHandler;
-
-      lh.doOnSubscribe();
+      this.doOnSubscribe();
 
       this.actual = actual;
 
@@ -308,10 +289,10 @@ public class UnicastMonoProcessor<O> extends Mono<O>
         // barrier to flush changes
         STATE.set(this, HAS_REQUEST_HAS_RESULT);
         if (e == null) {
-          lh.doOnTerminal(SignalType.ON_COMPLETE, null, null);
+          this.doOnTerminal(SignalType.ON_COMPLETE, null, null);
           Operators.complete(actual);
         } else {
-          lh.doOnTerminal(SignalType.ON_ERROR, null, e);
+          this.doOnTerminal(SignalType.ON_ERROR, null, e);
           Operators.error(actual, e);
         }
         return;
@@ -342,7 +323,7 @@ public class UnicastMonoProcessor<O> extends Mono<O>
             final O v = value;
             actual = null;
             value = null;
-            lifecycleHandler.doOnTerminal(SignalType.ON_COMPLETE, v, null);
+            this.doOnTerminal(SignalType.ON_COMPLETE, v, null);
             a.onNext(v);
             a.onComplete();
             return;
@@ -361,7 +342,7 @@ public class UnicastMonoProcessor<O> extends Mono<O>
       Operators.onDiscard(value, currentContext());
       value = null;
       actual = null;
-      lifecycleHandler.doOnTerminal(SignalType.CANCEL, null, null);
+      this.doOnTerminal(SignalType.CANCEL, null, null);
       final Subscription s = UPSTREAM.getAndSet(this, Operators.cancelledSubscription());
       if (s != null && s != Operators.cancelledSubscription()) {
         s.cancel();

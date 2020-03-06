@@ -46,6 +46,7 @@ import io.rsocket.keepalive.KeepAliveFramesAcceptor;
 import io.rsocket.keepalive.KeepAliveHandler;
 import io.rsocket.keepalive.KeepAliveSupport;
 import io.rsocket.lease.RequesterLeaseHandler;
+import io.rsocket.util.EmptyPayload;
 import io.rsocket.util.MonoLifecycleHandler;
 import java.nio.channels.ClosedChannelException;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -57,6 +58,7 @@ import javax.annotation.Nullable;
 import org.reactivestreams.Processor;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscriber;
+import org.reactivestreams.Subscription;
 import reactor.core.publisher.BaseSubscriber;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -67,7 +69,7 @@ import reactor.util.concurrent.Queues;
 /**
  * Requester Side of a RSocket socket. Sends {@link ByteBuf}s to a {@link RSocketResponder} of peer
  */
-class RSocketRequester implements RSocket {
+class RSocketRequester implements RSocket, StateAware {
   private static final AtomicReferenceFieldUpdater<RSocketRequester, Throwable> TERMINATION_ERROR =
       AtomicReferenceFieldUpdater.newUpdater(
           RSocketRequester.class, Throwable.class, "terminationError");
@@ -79,6 +81,7 @@ class RSocketRequester implements RSocket {
 
   private final DuplexConnection connection;
   private final PayloadDecoder payloadDecoder;
+  private final InteractionsFactory interactionsFactory;
   private final Consumer<Throwable> errorConsumer;
   private final StreamIdSupplier streamIdSupplier;
   private final IntObjectMap<RateLimitableRequestPublisher> senders;
@@ -132,7 +135,7 @@ class RSocketRequester implements RSocket {
 
   @Override
   public Mono<Void> fireAndForget(Payload payload) {
-    return handleFireAndForget(payload);
+    return interactionsFactory.fireAndForget(payload);
   }
 
   @Override
@@ -307,12 +310,26 @@ class RSocketRequester implements RSocket {
     final UnicastProcessor<Payload> receiver = UnicastProcessor.create();
     final int streamId = streamIdSupplier.nextStreamId(receivers);
 
+
     return receiver
         .doOnRequest(
             new LongConsumer() {
 
               boolean firstRequest = true;
 
+
+
+              // Wait for the first Paylaod (clientSide)
+              // wait for the first requestN (clientSide)
+              // comibine firstPayload and first requestN (clientSide) and then send to network
+
+
+
+              // downstream requested(1)
+              // RateLimitableRequestPublisher requested (1) to upstream
+              // downstream requested(n)
+              // we create sendProcessor.onNext(RequestNFrameFlyweight.encode(allocator, streamId, n));
+              // this frame is dropped
               @Override
               public void accept(long n) {
                 if (firstRequest) {
@@ -323,7 +340,7 @@ class RSocketRequester implements RSocket {
                             RateLimitableRequestPublisher<Payload> wrapped =
                                 RateLimitableRequestPublisher.wrap(f, Queues.SMALL_BUFFER_SIZE);
                             // Need to set this to one for first the frame
-                            wrapped.request(1);
+                            wrapped.request(1); // it is lost
                             senders.put(streamId, wrapped);
                             receivers.put(streamId, receiver);
 
@@ -415,7 +432,7 @@ class RSocketRequester implements RSocket {
         });
   }
 
-  private Throwable checkAvailable() {
+  public Throwable checkAvailable() {
     Throwable err = this.terminationError;
     if (err != null) {
       return err;
