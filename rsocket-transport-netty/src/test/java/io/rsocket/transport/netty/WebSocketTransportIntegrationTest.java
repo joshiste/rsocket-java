@@ -11,6 +11,9 @@ import io.rsocket.util.DefaultPayload;
 import io.rsocket.util.EmptyPayload;
 import java.net.URI;
 import java.time.Duration;
+import java.util.concurrent.ThreadLocalRandom;
+
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -55,6 +58,50 @@ public class WebSocketTransportIntegrationTest {
         .expectSubscription()
         .expectNextCount(10)
         .expectComplete()
+        .verify(Duration.ofMillis(1000));
+  }
+
+  @Test
+  @Disabled
+  public void sendPayloadBiggerThanAllowanceShouldReturnsNormally() {
+    byte[] payload = new byte[0xFFFFFF + 1];
+    ThreadLocalRandom.current().nextBytes(payload);
+
+    ServerTransport.ConnectionAcceptor acceptor =
+        RSocketFactory.receive()
+            .acceptor(
+                (setupPayload, sendingRSocket) -> {
+                  return Mono.just(
+                      new AbstractRSocket() {
+                        @Override
+                        public Flux<Payload> requestStream(Payload payload) {
+                          return Flux.range(0, 10)
+                              .map(i -> DefaultPayload.create(String.valueOf(i)));
+                        }
+                      });
+                })
+            .toConnectionAcceptor();
+
+    DisposableServer server =
+        HttpServer.create()
+            .host("localhost")
+            .route(router -> WebsocketRouteTransport.addRoutes(router, "/test", acceptor))
+            .bindNow();
+
+    RSocket rsocket =
+        RSocketFactory.connect()
+            .transport(
+                WebsocketClientTransport.create(
+                    URI.create("ws://" + server.host() + ":" + server.port() + "/test")))
+            .start()
+            .block();
+
+    StepVerifier.create(rsocket.requestStream(DefaultPayload.create(payload)))
+        .expectSubscription()
+        .expectErrorMatches(
+            t ->
+                t instanceof IllegalArgumentException
+                    && t.getMessage().equals("Length is larger than 24 bits"))
         .verify(Duration.ofMillis(1000));
   }
 }

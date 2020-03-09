@@ -25,7 +25,7 @@ public class DefaultInteractionsFactory implements InteractionsFactory {
 
     @Override
     public Mono<Void> fireAndForget(Payload payload) {
-        return new FireAndForgetMono(allocator, payload, stateAware, streamIdSupplier, registry, sendProcessor);
+        return new UnicastFireAndForgetMono(allocator, payload, stateAware, streamIdSupplier, registry, sendProcessor);
     }
 
     @Override

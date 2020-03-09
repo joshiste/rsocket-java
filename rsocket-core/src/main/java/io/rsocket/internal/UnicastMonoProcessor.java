@@ -16,7 +16,6 @@
 
 package io.rsocket.internal;
 
-import io.rsocket.util.MonoLifecycleHandler;
 import java.util.Objects;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;

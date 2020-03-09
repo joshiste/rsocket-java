@@ -7,6 +7,7 @@ import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.frame.RequestFireAndForgetFrameFlyweight;
 import io.rsocket.internal.UnboundedProcessor;
+import io.rsocket.internal.UnicastMonoProcessor;
 import reactor.core.CoreSubscriber;
 import reactor.core.Exceptions;
 import reactor.core.Scannable;
@@ -16,8 +17,15 @@ import reactor.util.annotation.NonNull;
 import reactor.util.annotation.Nullable;
 
 import java.time.Duration;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
-class FireAndForgetMono extends Mono<Void> implements Scannable {
+final class UnicastRequestResponseMono extends UnicastMonoProcessor<Payload> implements Scannable {
+
+
+    volatile int once;
+    @SuppressWarnings("rawtypes")
+    static final AtomicIntegerFieldUpdater<UnicastRequestResponseMono> ONCE =
+            AtomicIntegerFieldUpdater.newUpdater(UnicastRequestResponseMono.class, "once");
 
     final ByteBufAllocator allocator;
     final Payload payload;
@@ -26,7 +34,7 @@ class FireAndForgetMono extends Mono<Void> implements Scannable {
     final IntObjectMap<?> activeStreams;
     final UnboundedProcessor<ByteBuf> sendProcessor;
 
-    FireAndForgetMono(@NonNull ByteBufAllocator allocator, @NonNull Payload payload, @NonNull StateAware parent, @NonNull StreamIdSupplier streamIdSupplier, @NonNull IntObjectMap<?> activeStreams, @NonNull UnboundedProcessor<ByteBuf> sendProcessor) {
+    UnicastRequestResponseMono(@NonNull ByteBufAllocator allocator, @NonNull Payload payload, @NonNull StateAware parent, @NonNull StreamIdSupplier streamIdSupplier, @NonNull IntObjectMap<?> activeStreams, @NonNull UnboundedProcessor<ByteBuf> sendProcessor) {
         this.allocator = allocator;
         this.payload = payload;
         this.parent = parent;
@@ -41,24 +49,30 @@ class FireAndForgetMono extends Mono<Void> implements Scannable {
 
         if (throwable == null) {
             if (payload.refCnt() > 0) {
-                try {
-                    ByteBuf data = payload.data().retainedSlice();
-                    ByteBuf metadata = payload.hasMetadata() ? payload.metadata().retainedSlice() : null;
+                if (once == 0 && ONCE.compareAndSet(this, 0, 1)) {
+                    try {
+                        ByteBuf data = payload.data().retainedSlice();
+                        ByteBuf metadata = payload.hasMetadata() ? payload.metadata().retainedSlice() : null;
 
-                    int streamId = streamIdSupplier.nextStreamId(activeStreams);
+                        int streamId = streamIdSupplier.nextStreamId(activeStreams);
 
-                    ByteBuf requestFrame =
-                            RequestFireAndForgetFrameFlyweight.encode(
-                                    allocator,
-                                    streamId,
-                                    false,
-                                    metadata,
-                                    data);
+                        ByteBuf requestFrame =
+                                RequestFireAndForgetFrameFlyweight.encode(
+                                        allocator,
+                                        streamId,
+                                        false,
+                                        metadata,
+                                        data);
 
-                    sendProcessor.onNext(requestFrame);
-                    Operators.complete(actual);
-                } catch (IllegalReferenceCountException e) {
-                    Operators.error(actual, e);
+                        sendProcessor.onNext(requestFrame);
+                        Operators.complete(actual);
+                    } catch (IllegalReferenceCountException e) {
+                        Operators.error(actual, e);
+                    }
+                }
+                else {
+                    Operators.error(
+                            actual, new IllegalStateException("UnicastFireAndForgetMono allows only a single Subscriber"));
                 }
             } else {
                 Operators.error(actual, new IllegalReferenceCountException(0));
@@ -113,7 +127,7 @@ class FireAndForgetMono extends Mono<Void> implements Scannable {
     }
 
     @Override
-    public Object scanUnsafe(Scannable.Attr key) {
+    public Object scanUnsafe(Attr key) {
         return null; // no particular key to be represented, still useful in hooks
     }
 
