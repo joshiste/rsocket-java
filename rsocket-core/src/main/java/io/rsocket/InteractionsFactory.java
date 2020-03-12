@@ -7,7 +7,7 @@ public interface InteractionsFactory {
 
     Mono<Void> fireAndForget(Payload payload);
 
-    Mono<Payload> requestRespinse(Payload payload);
+    Mono<Payload> requestResponse(Payload payload);
 
     Flux<Payload> requestStream(Payload payload);
 

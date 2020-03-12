@@ -2,9 +2,11 @@ package io.rsocket;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.Unpooled;
 import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
+import io.rsocket.fragmentation.FragmentationUtils;
 import io.rsocket.frame.FrameLengthFlyweight;
 import io.rsocket.frame.FrameType;
 import io.rsocket.frame.RequestFireAndForgetFrameFlyweight;
@@ -22,7 +24,6 @@ import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 final class UnicastFireAndForgetMono extends Mono<Void> implements Scannable {
 
-
     volatile int once;
     @SuppressWarnings("rawtypes")
     static final AtomicIntegerFieldUpdater<UnicastFireAndForgetMono> ONCE =
@@ -30,14 +31,16 @@ final class UnicastFireAndForgetMono extends Mono<Void> implements Scannable {
 
     final ByteBufAllocator allocator;
     final Payload payload;
+    final int mtu;
     final StateAware parent;
     final StreamIdSupplier streamIdSupplier;
     final IntObjectMap<?> activeStreams;
     final UnboundedProcessor<ByteBuf> sendProcessor;
 
-    UnicastFireAndForgetMono(@NonNull ByteBufAllocator allocator, @NonNull Payload payload, @NonNull StateAware parent, @NonNull StreamIdSupplier streamIdSupplier, @NonNull IntObjectMap<?> activeStreams, @NonNull UnboundedProcessor<ByteBuf> sendProcessor) {
+    UnicastFireAndForgetMono(@NonNull ByteBufAllocator allocator, @NonNull Payload payload, int mtu, @NonNull StateAware parent, @NonNull StreamIdSupplier streamIdSupplier, @NonNull IntObjectMap<?> activeStreams, @NonNull UnboundedProcessor<ByteBuf> sendProcessor) {
         this.allocator = allocator;
         this.payload = payload;
+        this.mtu = mtu;
         this.parent = parent;
         this.streamIdSupplier = streamIdSupplier;
         this.activeStreams = activeStreams;
@@ -46,31 +49,49 @@ final class UnicastFireAndForgetMono extends Mono<Void> implements Scannable {
 
     @Override
     public void subscribe(CoreSubscriber<? super Void> actual) {
-        Throwable throwable = parent.checkAvailable();
+        final Throwable throwable = parent.checkAvailable();
+        final Payload p = this.payload;
 
         if (throwable == null) {
-            if (payload.refCnt() > 0) {
+            if (p.refCnt() > 0) {
                 if (once == 0 && ONCE.compareAndSet(this, 0, 1)) {
                     try {
-                        final boolean hasMetadata = payload.hasMetadata();
-                        final ByteBuf data = payload.data();
-                        final ByteBuf metadata = hasMetadata ? payload.metadata() : null;
-                        if (data.readableBytes() + (hasMetadata ? metadata.readableBytes() : 0) > FrameLengthFlyweight.FRAME_LENGTH_SIZE) {
+                        final boolean hasMetadata = p.hasMetadata();
+                        final ByteBuf data = p.data();
+                        final ByteBuf metadata = hasMetadata ? p.metadata() : null;
+                        final int mtu = this.mtu;
+
+                        if (mtu == 0 && data.readableBytes() + (hasMetadata ? metadata.readableBytes() : 0) > FrameLengthFlyweight.FRAME_LENGTH_SIZE) {
                             Operators.error(actual, new IllegalArgumentException("Too Big Payload size"));
                         } else {
+                            final int streamId = this.streamIdSupplier.nextStreamId(this.activeStreams);
+                            final UnboundedProcessor<ByteBuf> sender = this.sendProcessor;
+                            final ByteBufAllocator allocator = this.allocator;
                             final ByteBuf slicedData = data.retainedSlice();
-                            final ByteBuf slicedMetadata = hasMetadata ? payload.metadata().retainedSlice() : null;
-                            int streamId = streamIdSupplier.nextStreamId(activeStreams);
 
-                            ByteBuf requestFrame =
-                                    RequestFireAndForgetFrameFlyweight.encode(
-                                            allocator,
-                                            streamId,
-                                            false,
-                                            metadata,
-                                            data);
+                            if (mtu > 0) {
+                                final ByteBuf slicedMetadata = hasMetadata ? metadata.retainedSlice() : Unpooled.EMPTY_BUFFER;
 
-                            sendProcessor.onNext(requestFrame);
+                                final ByteBuf first = FragmentationUtils.encodeFirstFragment(allocator, mtu, FrameType.REQUEST_FNF, streamId, slicedMetadata, slicedData);
+                                sender.onNext(first);
+
+                                while (slicedData.isReadable() || slicedMetadata.isReadable()) {
+                                    ByteBuf following = FragmentationUtils.encodeFollowsFragment(allocator, mtu, streamId, slicedMetadata, slicedData);
+                                    sender.onNext(following);
+                                }
+                            } else {
+                                final ByteBuf slicedMetadata = hasMetadata ? metadata.retainedSlice() : null;
+
+                                final ByteBuf requestFrame =
+                                        RequestFireAndForgetFrameFlyweight.encode(
+                                                allocator,
+                                                streamId,
+                                                false,
+                                                slicedMetadata,
+                                                slicedData);
+                                sender.onNext(requestFrame);
+                            }
+
                             Operators.complete(actual);
                         }
                     } catch (IllegalReferenceCountException e) {
@@ -89,7 +110,7 @@ final class UnicastFireAndForgetMono extends Mono<Void> implements Scannable {
             Operators.error(actual, throwable);
         }
 
-        ReferenceCountUtil.safeRelease(payload);
+        ReferenceCountUtil.safeRelease(p);
     }
 
     @Override
