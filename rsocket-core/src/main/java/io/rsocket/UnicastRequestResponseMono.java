@@ -3,19 +3,16 @@ package io.rsocket;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
-import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.fragmentation.FragmentationUtils;
+import io.rsocket.frame.CancelFrameFlyweight;
 import io.rsocket.frame.FrameType;
-import io.rsocket.frame.RequestFireAndForgetFrameFlyweight;
 import io.rsocket.frame.RequestResponseFrameFlyweight;
 import io.rsocket.internal.UnboundedProcessor;
-import io.rsocket.internal.UnicastMonoProcessor;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 import reactor.core.CoreSubscriber;
-import reactor.core.Disposable;
 import reactor.core.Exceptions;
 import reactor.core.Scannable;
 import reactor.core.publisher.Mono;
@@ -25,10 +22,9 @@ import reactor.util.annotation.Nullable;
 import reactor.util.context.Context;
 
 import java.util.Objects;
-import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
-final class UnicastRequestResponseMono extends Mono<Payload>, CoreSubscriber<Payload>, Disposable, Subscription, Scannable {
+final class UnicastRequestResponseMono extends Mono<Payload> implements CoreSubscriber<Payload>, Subscription, Scannable {
 
     final ByteBufAllocator allocator;
     final Payload payload;
@@ -47,7 +43,7 @@ final class UnicastRequestResponseMono extends Mono<Payload>, CoreSubscriber<Pay
     static final AtomicIntegerFieldUpdater<UnicastRequestResponseMono> STATE =
             AtomicIntegerFieldUpdater.newUpdater(UnicastRequestResponseMono.class, "state");
 
-    int streamId = -1;
+    int streamId;
     CoreSubscriber<? super Payload> actual;
 
     UnicastRequestResponseMono(ByteBufAllocator allocator, Payload payload, int mtu, StateAware parent, StreamIdSupplier streamIdSupplier, IntObjectMap<Subscriber<? super Payload>> activeStreams, UnboundedProcessor<ByteBuf> sendProcessor) {
@@ -65,7 +61,7 @@ final class UnicastRequestResponseMono extends Mono<Payload>, CoreSubscriber<Pay
     public Context currentContext() {
         int state = this.state;
 
-        if (state == STATE_SUBSCRIBED) {
+        if (state >= STATE_SUBSCRIBED) {
             return this.actual.currentContext();
         }
 
@@ -74,7 +70,8 @@ final class UnicastRequestResponseMono extends Mono<Payload>, CoreSubscriber<Pay
 
     @Override
     public final void onSubscribe(Subscription subscription) {
-        subscription.request(Long.MAX_VALUE);
+        subscription.cancel();
+        // TODO: Add logging
     }
 
     @Override
@@ -91,6 +88,7 @@ final class UnicastRequestResponseMono extends Mono<Payload>, CoreSubscriber<Pay
             return;
         }
 
+        this.activeStreams.remove(this.streamId, this);
 
         this.actual.onError(cause);
     }
@@ -102,10 +100,9 @@ final class UnicastRequestResponseMono extends Mono<Payload>, CoreSubscriber<Pay
             return;
         }
 
-        final int streamId = this.streamId;
         final CoreSubscriber<? super Payload> a = this.actual;
 
-        this.activeStreams.remove(streamId);
+        this.activeStreams.remove(this.streamId, this);
 
         if (value != null) {
             a.onNext(value);
@@ -124,7 +121,7 @@ final class UnicastRequestResponseMono extends Mono<Payload>, CoreSubscriber<Pay
         } else {
             Operators.error(
                     actual,
-                    new IllegalStateException("UnicastMonoProcessor allows only a single Subscriber"));
+                    new IllegalStateException("UnicastRequestResponseMono allows only a single Subscriber"));
         }
     }
 
@@ -141,21 +138,22 @@ final class UnicastRequestResponseMono extends Mono<Payload>, CoreSubscriber<Pay
                 final boolean hasMetadata = p.hasMetadata();
                 final ByteBuf slicedData = p.data().retainedSlice();
                 final int streamId = this.streamIdSupplier.nextStreamId(as);
+
                 this.streamId = streamId;
-                as.put(streamId, this);
+
                 if (mtu > 0) {
                     final ByteBuf slicedMetadata = hasMetadata ? p.metadata().retainedSlice() : Unpooled.EMPTY_BUFFER;
+                    final ByteBuf first = FragmentationUtils.encodeFirstFragment(allocator, mtu, FrameType.REQUEST_RESPONSE, streamId, slicedMetadata, slicedData);
 
-                    final ByteBuf first = FragmentationUtils.encodeFirstFragment(allocator, mtu, FrameType.REQUEST_FNF, streamId, slicedMetadata, slicedData);
+                    as.put(streamId, this);
                     sender.onNext(first);
 
                     while (slicedData.isReadable() || slicedMetadata.isReadable()) {
-                        ByteBuf following = FragmentationUtils.encodeFollowsFragment(allocator, mtu, streamId, slicedMetadata, slicedData);
+                        final ByteBuf following = FragmentationUtils.encodeFollowsFragment(allocator, mtu, streamId, slicedMetadata, slicedData);
                         sender.onNext(following);
                     }
                 } else {
                     final ByteBuf slicedMetadata = hasMetadata ? p.metadata().retainedSlice() : null;
-
                     final ByteBuf requestFrame =
                             RequestResponseFrameFlyweight.encode(
                                     allocator,
@@ -163,14 +161,22 @@ final class UnicastRequestResponseMono extends Mono<Payload>, CoreSubscriber<Pay
                                     false,
                                     slicedMetadata,
                                     slicedData);
+
+                    as.put(streamId, this);
                     sender.onNext(requestFrame);
                 }
-            } catch (IllegalReferenceCountException e) {
+            } catch (Throwable e) {
+                ReferenceCountUtil.safeRelease(p);
+
+                Exceptions.throwIfFatal(e);
+
                 final int streamId = this.streamId;
-                if (streamId != -1) {
-                    as.put(streamId, this);
+                if (as.remove(streamId, this)) {
+                    final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
+                    sender.onNext(cancelFrame);
                 }
-                this.onError(e);
+
+                this.actual.onError(e);
             }
         }
     }
@@ -180,102 +186,14 @@ final class UnicastRequestResponseMono extends Mono<Payload>, CoreSubscriber<Pay
         int state = this.state;
         if (state != STATE_TERMINATED && STATE.getAndSet(this, STATE_TERMINATED) != STATE_TERMINATED) {
             if (state == STATE_REQUESTED) {
-                this.activeStreams.remove(this.streamId, this);
+                final int streamId = this.streamId;
+
+                this.activeStreams.remove(streamId, this);
+                this.sendProcessor.onNext(CancelFrameFlyweight.encode(this.allocator, streamId));
+            } else if (state == STATE_SUBSCRIBED) {
+                ReferenceCountUtil.safeRelease(this.payload);
             }
         }
-    }
-
-    @Override
-    public void dispose() {
-        final Subscription s = UPSTREAM.getAndSet(this, Operators.cancelledSubscription());
-        if (s == Operators.cancelledSubscription()) {
-            return;
-        }
-
-        if (s != null) {
-            s.cancel();
-        }
-
-        complete(new CancellationException("Disposed"));
-    }
-
-    /**
-     * Returns the value that completed this {@link UnicastMonoProcessor}. Returns {@code null} if the
-     * {@link UnicastMonoProcessor} has not been completed. If the {@link UnicastMonoProcessor} is
-     * completed with an error a RuntimeException that wraps the error is thrown.
-     *
-     * @return the value that completed the {@link UnicastMonoProcessor}, or {@code null} if it has
-     *     not been completed
-     * @throws RuntimeException if the {@link UnicastMonoProcessor} was completed with an error
-     */
-    @Nullable
-    public O peek() {
-        if (isCancelled()) {
-            return null;
-        }
-
-        if (value != null) {
-            return value;
-        }
-
-        if (error != null) {
-            RuntimeException re = Exceptions.propagate(error);
-            re = Exceptions.addSuppressed(re, new Exception("Mono#peek terminated with an error"));
-            throw re;
-        }
-
-        return null;
-    }
-
-    /**
-     * Set the error internally, without impacting request tracking state.
-     *
-     * @param throwable the error.
-     * @see #complete(Object)
-     */
-    private void setError(Throwable throwable) {
-        this.error = throwable;
-    }
-
-    /**
-     * Return the produced {@link Throwable} error if any or null
-     *
-     * @return the produced {@link Throwable} error if any or null
-     */
-    @Nullable
-    public final Throwable getError() {
-        return isDisposed() ? error : null;
-    }
-
-    /**
-     * Indicates whether this {@code UnicastMonoProcessor} has been completed with an error.
-     *
-     * @return {@code true} if this {@code UnicastMonoProcessor} was completed with an error, {@code
-     *     false} otherwise.
-     */
-    public final boolean isError() {
-        return getError() != null;
-    }
-
-    /**
-     * Indicates whether this {@code UnicastMonoProcessor} has been interrupted via cancellation.
-     *
-     * @return {@code true} if this {@code UnicastMonoProcessor} is cancelled, {@code false}
-     *     otherwise.
-     */
-    public boolean isCancelled() {
-        return state == CANCELLED;
-    }
-
-    public final boolean isTerminated() {
-        int state = this.state;
-        return (state < CANCELLED && state % 2 == 1);
-    }
-
-    @Override
-    public boolean isDisposed() {
-        int state = this.state;
-        return state == CANCELLED || (state < CANCELLED && state % 2 == 1);
     }
 
     @Override
@@ -284,30 +202,15 @@ final class UnicastRequestResponseMono extends Mono<Payload>, CoreSubscriber<Pay
         // touch guard
         int state = this.state;
 
-        if (key == Attr.TERMINATED) {
-            return (state < CANCELLED && state % 2 == 1);
-        }
-        if (key == Attr.PARENT) {
-            return subscription;
-        }
-        if (key == Attr.ERROR) {
-            return error;
-        }
-        if (key == Attr.PREFETCH) {
-            return Integer.MAX_VALUE;
-        }
-        if (key == Attr.CANCELLED) {
-            return state == CANCELLED;
-        }
+        if (key == Attr.TERMINATED) return state == STATE_TERMINATED;
+        if (key == Attr.PREFETCH) return Integer.MAX_VALUE;
+
         return null;
     }
 
-    /**
-     * Return true if any {@link Subscriber} is actively subscribed
-     *
-     * @return true if any {@link Subscriber} is actively subscribed
-     */
-    public final boolean hasDownstream() {
-        return state > NO_SUBSCRIBER_HAS_RESULT && actual != null;
+    @Override
+    @NonNull
+    public String stepName() {
+        return "source(UnicastRequestResponseMono)";
     }
 }

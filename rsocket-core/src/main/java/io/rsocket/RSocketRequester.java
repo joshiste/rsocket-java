@@ -81,7 +81,6 @@ class RSocketRequester implements RSocket, StateAware {
 
   private final DuplexConnection connection;
   private final PayloadDecoder payloadDecoder;
-  private final InteractionsFactory interactionsFactory;
   private final Consumer<Throwable> errorConsumer;
   private final StreamIdSupplier streamIdSupplier;
   private final IntObjectMap<RateLimitableRequestPublisher> senders;
@@ -135,7 +134,7 @@ class RSocketRequester implements RSocket, StateAware {
 
   @Override
   public Mono<Void> fireAndForget(Payload payload) {
-    return interactionsFactory.fireAndForget(payload);
+    return null;
   }
 
   @Override
@@ -212,39 +211,39 @@ class RSocketRequester implements RSocket, StateAware {
     int streamId = streamIdSupplier.nextStreamId(receivers);
     final UnboundedProcessor<ByteBuf> sendProcessor = this.sendProcessor;
 
-    UnicastMonoProcessor<Payload> receiver =
-        UnicastMonoProcessor.create(
-            new MonoLifecycleHandler<Payload>() {
-              @Override
-              public void doOnSubscribe() {
-                final ByteBuf requestFrame =
-                    RequestResponseFrameFlyweight.encode(
-                        allocator,
-                        streamId,
-                        false,
-                        payload.sliceMetadata().retain(),
-                        payload.sliceData().retain());
-                payload.release();
+//    UnicastMonoProcessor<Payload> receiver =
+//        UnicastMonoProcessor.create(
+//            new MonoLifecycleHandler<Payload>() {
+//              @Override
+//              public void doOnSubscribe() {
+//                final ByteBuf requestFrame =
+//                    RequestResponseFrameFlyweight.encode(
+//                        allocator,
+//                        streamId,
+//                        false,
+//                        payload.sliceMetadata().retain(),
+//                        payload.sliceData().retain());
+//                payload.release();
+//
+//                sendProcessor.onNext(requestFrame);
+//              }
+//
+//              @Override
+//              public void doOnTerminal(
+//                  @Nonnull SignalType signalType,
+//                  @Nullable Payload element,
+//                  @Nullable Throwable e) {
+//                if (signalType == SignalType.ON_ERROR) {
+//                  sendProcessor.onNext(ErrorFrameFlyweight.encode(allocator, streamId, e));
+//                } else if (signalType == SignalType.CANCEL) {
+//                  sendProcessor.onNext(CancelFrameFlyweight.encode(allocator, streamId));
+//                }
+//                removeStreamReceiver(streamId);
+//              }
+//            });
+//    receivers.put(streamId, receiver);
 
-                sendProcessor.onNext(requestFrame);
-              }
-
-              @Override
-              public void doOnTerminal(
-                  @Nonnull SignalType signalType,
-                  @Nullable Payload element,
-                  @Nullable Throwable e) {
-                if (signalType == SignalType.ON_ERROR) {
-                  sendProcessor.onNext(ErrorFrameFlyweight.encode(allocator, streamId, e));
-                } else if (signalType == SignalType.CANCEL) {
-                  sendProcessor.onNext(CancelFrameFlyweight.encode(allocator, streamId));
-                }
-                removeStreamReceiver(streamId);
-              }
-            });
-    receivers.put(streamId, receiver);
-
-    return receiver;
+    return null;
   }
 
   private Flux<Payload> handleRequestStream(final Payload payload) {

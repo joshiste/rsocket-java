@@ -11,16 +11,21 @@ import io.rsocket.frame.FrameLengthFlyweight;
 import io.rsocket.frame.FrameType;
 import io.rsocket.frame.RequestFireAndForgetFrameFlyweight;
 import io.rsocket.internal.UnboundedProcessor;
+import org.reactivestreams.Publisher;
 import reactor.core.CoreSubscriber;
 import reactor.core.Exceptions;
 import reactor.core.Scannable;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Operators;
 import reactor.util.annotation.NonNull;
 import reactor.util.annotation.Nullable;
 
 import java.time.Duration;
+import java.util.LinkedList;
+import java.util.Queue;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.function.Function;
 
 final class UnicastFireAndForgetMono extends Mono<Void> implements Scannable {
 
@@ -125,31 +130,31 @@ final class UnicastFireAndForgetMono extends Mono<Void> implements Scannable {
         Throwable throwable = parent.checkAvailable();
 
         if (throwable == null) {
-            if (payload.refCnt() > 0) {
+            if (this.payload.refCnt() > 0) {
                 try {
-                    ByteBuf data = payload.data().retainedSlice();
-                    ByteBuf metadata = payload.hasMetadata() ? payload.metadata().retainedSlice() : null;
+                    ByteBuf data = this.payload.data().retainedSlice();
+                    ByteBuf metadata = this.payload.hasMetadata() ? this.payload.metadata().retainedSlice() : null;
 
-                    int streamId = streamIdSupplier.nextStreamId(activeStreams);
+                    int streamId = this.streamIdSupplier.nextStreamId(this.activeStreams);
 
                     ByteBuf requestFrame =
                             RequestFireAndForgetFrameFlyweight.encode(
-                                    allocator,
+                                    this.allocator,
                                     streamId,
                                     false,
                                     metadata,
                                     data);
 
-                    sendProcessor.onNext(requestFrame);
+                    this.sendProcessor.onNext(requestFrame);
                     return null;
                 } finally {
-                    ReferenceCountUtil.safeRelease(payload);
+                    ReferenceCountUtil.safeRelease(this.payload);
                 }
             } else {
                 return null;
             }
         } else {
-            ReferenceCountUtil.safeRelease(payload);
+            ReferenceCountUtil.safeRelease(this.payload);
             throw Exceptions.propagate(throwable);
         }
     }
@@ -162,6 +167,6 @@ final class UnicastFireAndForgetMono extends Mono<Void> implements Scannable {
     @Override
     @NonNull
     public String stepName() {
-        return "source(FireAndForgetMono)";
+        return "source(UnicastFireAndForgetMono)";
     }
 }
