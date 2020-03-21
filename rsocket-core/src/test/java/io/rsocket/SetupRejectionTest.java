@@ -57,6 +57,7 @@ public class SetupRejectionTest {
             StreamIdSupplier.clientSupplier(),
             0,
             0,
+            0,
             null,
             RequesterLeaseHandler.None);
 
@@ -90,6 +91,7 @@ public class SetupRejectionTest {
             DefaultPayload::create,
             err -> {},
             StreamIdSupplier.clientSupplier(),
+            0,
             0,
             0,
             null,

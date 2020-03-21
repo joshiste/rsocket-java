@@ -5,11 +5,11 @@ import reactor.core.publisher.Mono;
 
 public interface InteractionsFactory {
 
-    Mono<Void> fireAndForget(Payload payload);
+  Mono<Void> fireAndForget(Payload payload);
 
-    Mono<Payload> requestResponse(Payload payload);
+  Mono<Payload> requestResponse(Payload payload);
 
-    Flux<Payload> requestStream(Payload payload);
+  Flux<Payload> requestStream(Payload payload);
 
-    Flux<Payload> requestChannel(Flux<Payload> payloadFlux);
+  Flux<Payload> requestChannel(Flux<Payload> payloadFlux);
 }

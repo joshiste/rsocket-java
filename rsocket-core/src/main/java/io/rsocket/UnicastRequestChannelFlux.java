@@ -7,12 +7,15 @@ import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.fragmentation.FragmentationUtils;
 import io.rsocket.frame.CancelFrameFlyweight;
+import io.rsocket.frame.ErrorFrameFlyweight;
 import io.rsocket.frame.FrameType;
+import io.rsocket.frame.PayloadFrameFlyweight;
+import io.rsocket.frame.RequestChannelFrameFlyweight;
 import io.rsocket.frame.RequestNFrameFlyweight;
-import io.rsocket.frame.RequestStreamFrameFlyweight;
 import io.rsocket.internal.UnboundedProcessor;
-import org.reactivestreams.Publisher;
-import org.reactivestreams.Subscriber;
+import java.util.Objects;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import org.reactivestreams.Subscription;
 import reactor.core.CoreSubscriber;
 import reactor.core.Exceptions;
@@ -23,311 +26,444 @@ import reactor.util.annotation.NonNull;
 import reactor.util.annotation.Nullable;
 import reactor.util.context.Context;
 
-import java.util.Objects;
-import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+final class UnicastRequestChannelFlux extends Flux<Payload>
+    implements CoreSubscriber<Payload>, Subscription, Scannable {
 
-final class UnicastRequestChannelFlux extends Flux<Payload> implements CoreSubscriber<Payload>, Subscription, Scannable {
+  final ByteBufAllocator allocator;
+  final int mtu;
+  final Flux<Payload> payloadPublisher;
+  final StateAware parent;
+  final StreamIdSupplier streamIdSupplier;
+  final IntObjectMap<CoreSubscriber<? super Payload>> activeStreams;
+  final IntObjectMap<Subscription> activeSubscriptions;
+  final UnboundedProcessor<ByteBuf> sendProcessor;
 
-    final ByteBufAllocator allocator;
-    final int mtu;
-    final Publisher<Payload> payloadPublisher;
-    final StateAware parent;
-    final StreamIdSupplier streamIdSupplier;
-    final IntObjectMap<Subscriber<? super Payload>> activeStreams;
-    final UnboundedProcessor<ByteBuf> sendProcessor;
+  static final long STATE_UNSUBSCRIBED = -2;
+  static final long STATE_SUBSCRIBED = -1;
+  static final long STATE_WIRED = -3;
+  static final long STATE_TERMINATED = Long.MIN_VALUE;
 
-    static final long STATE_UNSUBSCRIBED = -2;
-    static final long STATE_SUBSCRIBED = -1;
-    static final long STATE_WAS_REQUESTED_MAX = -3;
-    static final long STATE_TERMINATED = Long.MIN_VALUE;
+  volatile long requested;
+  static final AtomicLongFieldUpdater<UnicastRequestChannelFlux> REQUESTED =
+      AtomicLongFieldUpdater.newUpdater(UnicastRequestChannelFlux.class, "requested");
 
-    volatile long requested;
-    static final AtomicLongFieldUpdater<UnicastRequestChannelFlux> REQUESTED =
-            AtomicLongFieldUpdater.newUpdater(UnicastRequestChannelFlux.class, "requested");
+  int streamId;
+  InnerConnectorSubscriber connector;
 
-    Payload firstPayload;
-    int streamId;
-    CoreSubscriber<? super Payload> actual;
+  boolean first = true;
 
-    UnicastRequestChannelFlux(ByteBufAllocator allocator, Publisher<Payload> payloadPublisher, int mtu, StateAware parent, StreamIdSupplier streamIdSupplier, IntObjectMap<Subscriber<? super Payload>> activeStreams, UnboundedProcessor<ByteBuf> sendProcessor) {
-        this.allocator = allocator;
-        this.payloadPublisher = payloadPublisher;
-        this.mtu = mtu;
-        this.parent = parent;
-        this.streamIdSupplier = streamIdSupplier;
-        this.activeStreams = activeStreams;
-        this.sendProcessor = sendProcessor;
+  UnicastRequestChannelFlux(
+      ByteBufAllocator allocator,
+      Flux<Payload> payloadPublisher,
+      int mtu,
+      StateAware parent,
+      StreamIdSupplier streamIdSupplier,
+      IntObjectMap<CoreSubscriber<? super Payload>> activeSubscribers,
+      IntObjectMap<Subscription> activeSubscriptions,
+      UnboundedProcessor<ByteBuf> sendProcessor) {
+    this.allocator = allocator;
+    this.payloadPublisher = payloadPublisher;
+    this.mtu = mtu;
+    this.parent = parent;
+    this.streamIdSupplier = streamIdSupplier;
+    this.activeStreams = activeSubscribers;
+    this.activeSubscriptions = activeSubscriptions;
+    this.sendProcessor = sendProcessor;
+
+    REQUESTED.lazySet(this, STATE_UNSUBSCRIBED);
+  }
+
+  @Override
+  @NonNull
+  public Context currentContext() {
+    long state = this.requested;
+
+    if (state == STATE_UNSUBSCRIBED) {
+      return Context.empty();
     }
 
-    @Override
-    @NonNull
-    public Context currentContext() {
-        long state = this.requested;
+    return this.connector.currentContext();
+  }
 
-        if (state == STATE_UNSUBSCRIBED) {
-            return Context.empty();
+  @Override
+  public void onSubscribe(Subscription s) {
+    this.connector.onSubscribe(s);
+  }
+
+  @Override
+  public void onNext(Payload p) {
+    final UnboundedProcessor<ByteBuf> sender = this.sendProcessor;
+    final ByteBufAllocator allocator = this.allocator;
+    final IntObjectMap<CoreSubscriber<? super Payload>> as = this.activeStreams;
+    final IntObjectMap<Subscription> ass = this.activeSubscriptions;
+    final int mtu = this.mtu;
+
+    int streamId = this.streamId;
+    if (this.first) {
+      this.first = false;
+
+      boolean firstLoop = true;
+      long requested;
+
+      // to prevent racing between requests and onNext and to make sure the RequestChannelFrame goes
+      // first
+      // in case of racing may deliver work from requestN
+      for (; ; ) {
+        requested = this.requested;
+
+        if (requested == STATE_TERMINATED) {
+          if (firstLoop) {
+            ReferenceCountUtil.safeRelease(p);
+          } else {
+            if (as.remove(streamId, this.connector)) {
+              ass.remove(streamId, this.connector);
+              final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
+              sender.onNext(cancelFrame);
+            }
+          }
+          return;
         }
 
-        return this.actual.currentContext();
+        if (firstLoop) {
+          final Throwable throwable = parent.checkAvailable();
+          if (throwable != null) {
+            this.connector.onError(throwable);
+            return;
+          }
+          try {
+            final boolean hasMetadata = p.hasMetadata();
+            final ByteBuf slicedData = p.data().retainedSlice();
+
+            streamId = this.streamIdSupplier.nextStreamId(as);
+
+            this.streamId = streamId;
+
+            if (mtu > 0) {
+              final ByteBuf slicedMetadata =
+                  hasMetadata ? p.metadata().retainedSlice() : Unpooled.EMPTY_BUFFER;
+
+              final ByteBuf first =
+                  FragmentationUtils.encodeFirstFragment(
+                      allocator,
+                      mtu,
+                      (int) (requested & Integer.MAX_VALUE),
+                      FrameType.REQUEST_CHANNEL,
+                      streamId,
+                      slicedMetadata,
+                      slicedData);
+
+              as.put(streamId, this.connector);
+              ass.put(streamId, this.connector);
+              sender.onNext(first);
+
+              while (slicedData.isReadable() || slicedMetadata.isReadable()) {
+                final ByteBuf following =
+                    FragmentationUtils.encodeFollowsFragment(
+                        allocator, mtu, streamId, slicedMetadata, slicedData);
+                sender.onNext(following);
+              }
+            } else {
+              final ByteBuf slicedMetadata = hasMetadata ? p.metadata().retainedSlice() : null;
+
+              final ByteBuf requestFrame =
+                  RequestChannelFrameFlyweight.encode(
+                      allocator, streamId, false, false, requested, slicedMetadata, slicedData);
+
+              as.put(streamId, this.connector);
+              ass.put(streamId, this.connector);
+              sender.onNext(requestFrame);
+            }
+
+            ReferenceCountUtil.safeRelease(p);
+          } catch (Throwable e) {
+            this.requested = STATE_TERMINATED;
+
+            ReferenceCountUtil.safeRelease(p);
+            Exceptions.throwIfFatal(e);
+
+            this.connector.s.cancel();
+
+            if (as.remove(streamId, this.connector)) {
+              ass.remove(streamId, this.connector);
+              final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
+              sender.onNext(cancelFrame);
+            }
+
+            this.connector.actual.onError(e);
+
+            return;
+          }
+        } else {
+          final ByteBuf requestNFrame =
+              RequestNFrameFlyweight.encode(allocator, streamId, requested);
+          sender.onNext(requestNFrame);
+        }
+
+        if (REQUESTED.compareAndSet(this, requested, STATE_WIRED)) {
+          break;
+        }
+        firstLoop = false;
+      }
+    } else {
+      try {
+        final boolean hasMetadata = p.hasMetadata();
+        final ByteBuf slicedData = p.data().retainedSlice();
+
+        if (mtu > 0) {
+          final ByteBuf slicedMetadata =
+              hasMetadata ? p.metadata().retainedSlice() : Unpooled.EMPTY_BUFFER;
+
+          final ByteBuf first =
+              FragmentationUtils.encodeFirstFragment(
+                  allocator, mtu, FrameType.NEXT, streamId, slicedMetadata, slicedData);
+          sender.onNext(first);
+
+          while (slicedData.isReadable() || slicedMetadata.isReadable()) {
+            final ByteBuf following =
+                FragmentationUtils.encodeFollowsFragment(
+                    allocator, mtu, streamId, slicedMetadata, slicedData);
+            sender.onNext(following);
+          }
+        } else {
+          final ByteBuf slicedMetadata = hasMetadata ? p.metadata().retainedSlice() : null;
+
+          final ByteBuf nextFrame =
+              PayloadFrameFlyweight.encode(
+                  allocator, streamId, false, false, true, slicedMetadata, slicedData);
+
+          sender.onNext(nextFrame);
+        }
+
+        ReferenceCountUtil.safeRelease(p);
+      } catch (Throwable e) {
+        ReferenceCountUtil.safeRelease(p);
+
+        Exceptions.throwIfFatal(e);
+
+        final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
+        sender.onNext(cancelFrame);
+
+        this.connector.onError(e);
+      }
+    }
+  }
+
+  @Override
+  public void onError(Throwable t) {
+    long state = REQUESTED.getAndSet(this, STATE_TERMINATED);
+    if (state == STATE_TERMINATED) {
+      Operators.onErrorDropped(t, currentContext());
+      return;
+    }
+
+    if (state == STATE_WIRED) {
+      final int streamId = this.streamId;
+      this.activeSubscriptions.remove(streamId, this.connector);
+      this.activeStreams.remove(streamId, this.connector);
+
+      final ByteBuf errorFrame = ErrorFrameFlyweight.encode(this.allocator, streamId, t);
+      this.sendProcessor.onNext(errorFrame);
+    }
+    this.connector.actual.onError(t);
+  }
+
+  @Override
+  public void onComplete() {
+    long state = this.requested;
+    if (state == STATE_TERMINATED) {
+      return;
+    }
+
+    if (state == STATE_WIRED) {
+      final int streamId = this.streamId;
+      this.activeSubscriptions.remove(streamId, this.connector);
+
+      final ByteBuf completeFrame = PayloadFrameFlyweight.encodeComplete(this.allocator, streamId);
+      this.sendProcessor.onNext(completeFrame);
+    } else {
+      this.connector.actual.onError(new CancellationException("Empty Source"));
+    }
+  }
+
+  @Override
+  public void subscribe(CoreSubscriber<? super Payload> actual) {
+    Objects.requireNonNull(actual, "subscribe");
+
+    if (this.requested == STATE_UNSUBSCRIBED
+        && REQUESTED.compareAndSet(this, STATE_UNSUBSCRIBED, STATE_SUBSCRIBED)) {
+      this.connector =
+          new InnerConnectorSubscriber(this, actual, activeStreams, activeSubscriptions);
+      this.payloadPublisher.subscribe(this);
+    } else {
+      Operators.error(
+          actual,
+          new IllegalStateException("UnicastRequestStreamFlux allows only a single Subscriber"));
+    }
+  }
+
+  @Override
+  public final void request(long n) {
+    if (!Operators.validate(n)) {
+      return;
+    }
+
+    long currentRequested;
+    long nextRequested;
+    for (; ; ) {
+      currentRequested = this.requested;
+
+      if (currentRequested == STATE_WIRED) {
+        final ByteBuf requestNFrame =
+            RequestNFrameFlyweight.encode(this.allocator, this.streamId, n);
+        this.sendProcessor.onNext(requestNFrame);
+        return;
+      }
+
+      if (currentRequested == Long.MAX_VALUE) {
+        return;
+      }
+
+      if (currentRequested == STATE_TERMINATED) {
+        return;
+      }
+
+      if (currentRequested == STATE_SUBSCRIBED) {
+        nextRequested = n;
+      } else {
+        nextRequested = Operators.addCap(currentRequested, n);
+      }
+
+      if (REQUESTED.compareAndSet(this, currentRequested, nextRequested)) {
+        if (currentRequested == STATE_SUBSCRIBED) {
+          // do first request
+          this.connector.request(1);
+        }
+        break;
+      }
+    }
+  }
+
+  @Override
+  public final void cancel() {
+    final long state = REQUESTED.getAndSet(this, STATE_TERMINATED);
+    if (state != STATE_TERMINATED) {
+      final InnerConnectorSubscriber connector = this.connector;
+      connector.cancel();
+
+      if (state != STATE_WIRED) {
+        // no need to send anything, since we have not started a stream yet (no logical wire)
+        return;
+      }
+
+      final int streamId = this.streamId;
+      this.activeStreams.remove(streamId, connector);
+
+      final ByteBuf cancelFrame = CancelFrameFlyweight.encode(this.allocator, streamId);
+      this.sendProcessor.onNext(cancelFrame);
+    }
+  }
+
+  boolean isTerminated() {
+    return this.requested == STATE_TERMINATED;
+  }
+
+  @Override
+  @Nullable
+  public Object scanUnsafe(Attr key) {
+    // touch guard
+    long state = this.requested;
+
+    if (key == Attr.TERMINATED) return state == STATE_TERMINATED;
+    if (key == Attr.REQUESTED_FROM_DOWNSTREAM) return state;
+
+    return null;
+  }
+
+  @Override
+  @NonNull
+  public String stepName() {
+    return "source(UnicastRequestChannelFlux)";
+  }
+
+  // this should be stored to listen for requestN frames from the Responder side
+  // this should accommodate frame sending logic, since it receives frames from the requester side
+  // and should deliver them to the responder one
+  static final class InnerConnectorSubscriber implements CoreSubscriber<Payload>, Subscription {
+
+    final UnicastRequestChannelFlux parent;
+    final CoreSubscriber<? super Payload> actual;
+    final IntObjectMap<CoreSubscriber<? super Payload>> activeStreams;
+    final IntObjectMap<Subscription> activeSubscriptions;
+
+    Subscription s;
+
+    InnerConnectorSubscriber(
+        UnicastRequestChannelFlux parent,
+        CoreSubscriber<? super Payload> actual,
+        IntObjectMap<CoreSubscriber<? super Payload>> activeStreams,
+        IntObjectMap<Subscription> activeSubscriptions) {
+      this.parent = parent;
+      this.actual = actual;
+      this.activeStreams = activeStreams;
+      this.activeSubscriptions = activeSubscriptions;
     }
 
     @Override
-    public final void onSubscribe(Subscription subscription) {
-        subscription.cancel();
-        // TODO: Add logging
+    public final void onSubscribe(Subscription outerSubscription) {
+      if (Operators.validate(this.s, outerSubscription)) {
+        this.s = outerSubscription;
+        this.actual.onSubscribe(this.parent);
+      }
     }
 
     @Override
     public final void onComplete() {
-        if (this.requested == STATE_TERMINATED) {
-            return;
-        }
+      if (this.parent.isTerminated()) {
+        return;
+      }
 
-        this.activeStreams.remove(this.streamId, this);
+      this.activeStreams.remove(this.parent.streamId, this);
 
-        this.actual.onComplete();
+      this.actual.onComplete();
     }
 
     @Override
     public final void onError(Throwable cause) {
-        Objects.requireNonNull(cause, "onError cannot be null");
+      Objects.requireNonNull(cause, "onError cannot be null");
 
-        if (this.requested == STATE_TERMINATED) {
-            Operators.onErrorDropped(cause, currentContext());
-            return;
-        }
+      if (REQUESTED.getAndSet(this.parent, STATE_TERMINATED) == STATE_TERMINATED) {
+        Operators.onErrorDropped(cause, currentContext());
+        return;
+      }
 
-        this.activeStreams.remove(this.streamId, this);
+      final int streamId = this.parent.streamId;
 
-        this.actual.onError(cause);
+      this.activeSubscriptions.remove(streamId, this);
+      this.activeStreams.remove(streamId, this);
+
+      this.s.cancel();
+      this.actual.onError(cause);
     }
 
     @Override
     public final void onNext(Payload value) {
-        if (this.requested == STATE_TERMINATED) {
-            ReferenceCountUtil.safeRelease(value);
-            return;
-        }
+      if (this.parent.isTerminated()) {
+        ReferenceCountUtil.safeRelease(value);
+        return;
+      }
 
-        this.actual.onNext(value);
+      this.actual.onNext(value);
     }
 
     @Override
-    public void subscribe(CoreSubscriber<? super Payload> actual) {
-        Objects.requireNonNull(actual, "subscribe");
-
-        if (this.requested == STATE_UNSUBSCRIBED && REQUESTED.compareAndSet(this, STATE_UNSUBSCRIBED, STATE_SUBSCRIBED)) {
-            this.actual = actual;
-            // call onSubscribe if has value in the result or no result delivered so far
-            actual.onSubscribe(this);
-        } else {
-            Operators.error(
-                    actual,
-                    new IllegalStateException("UnicastRequestStreamFlux allows only a single Subscriber"));
-        }
+    public void request(long n) {
+      this.s.request(n);
     }
 
     @Override
-    public final void request(long n) {
-        if (!Operators.validate(n)) {
-            return;
-        }
-
-        long currentRequested;
-        long nextRequested;
-        for (;;) {
-            currentRequested = this.requested;
-
-            if (currentRequested == STATE_WAS_REQUESTED_MAX) {
-                return;
-            }
-
-            if (currentRequested == Long.MAX_VALUE) {
-                return;
-            }
-
-            if (currentRequested == STATE_TERMINATED) {
-                return;
-            }
-
-            if (currentRequested == STATE_SUBSCRIBED) {
-                nextRequested = n;
-            } else {
-                nextRequested = Operators.addCap(currentRequested, n);
-            }
-
-            if (REQUESTED.compareAndSet(this, currentRequested, nextRequested)) {
-                break;
-            }
-        }
-
-        if (currentRequested > 0) {
-            return;
-        }
-
-        final UnboundedProcessor<ByteBuf> sender = this.sendProcessor;
-        final ByteBufAllocator allocator = this.allocator;
-
-        int streamId = this.streamId;
-
-        for (;;) {
-            if (currentRequested == STATE_SUBSCRIBED) {
-                final IntObjectMap<Subscriber<? super Payload>> as = this.activeStreams;
-                final Payload p = this.firstPayload;
-                final int mtu = this.mtu;
-
-                try {
-                    final boolean hasMetadata = p.hasMetadata();
-                    final ByteBuf slicedData = p.data().retainedSlice();
-
-                    streamId = this.streamIdSupplier.nextStreamId(as);
-                    this.streamId = streamId;
-
-                    if (mtu > 0) {
-                        final ByteBuf slicedMetadata = hasMetadata ? p.metadata().retainedSlice() : Unpooled.EMPTY_BUFFER;
-
-                        final ByteBuf first = FragmentationUtils.encodeFirstFragment(allocator, mtu, (int) (nextRequested & Integer.MAX_VALUE), FrameType.REQUEST_STREAM, streamId, slicedMetadata, slicedData);
-
-                        as.put(streamId, this);
-                        sender.onNext(first);
-
-                        while (slicedData.isReadable() || slicedMetadata.isReadable()) {
-                            final ByteBuf following = FragmentationUtils.encodeFollowsFragment(allocator, mtu, streamId, slicedMetadata, slicedData);
-                            sender.onNext(following);
-                        }
-                    } else {
-                        final ByteBuf slicedMetadata = hasMetadata ? p.metadata().retainedSlice() : null;
-
-                        final ByteBuf requestFrame =
-                                RequestStreamFrameFlyweight.encode(
-                                        allocator,
-                                        streamId,
-                                        false,
-                                        n,
-                                        slicedMetadata,
-                                        slicedData);
-
-                        as.put(streamId, this);
-                        sender.onNext(requestFrame);
-                    }
-
-                    ReferenceCountUtil.safeRelease(p);
-                } catch (Throwable e) {
-                    ReferenceCountUtil.safeRelease(p);
-
-                    Exceptions.throwIfFatal(e);
-
-                    if (as.remove(streamId, this)) {
-                        final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
-                        sender.onNext(cancelFrame);
-                    }
-
-                    this.actual.onError(e);
-
-                    return;
-                }
-            } else {
-                final ByteBuf requestNFrame = RequestNFrameFlyweight.encode(allocator, streamId, nextRequested);
-                sender.onNext(requestNFrame);
-            }
-
-            for (;;) {
-                long toUpdate;
-                // now currentRequested is newer than nextRequested
-                currentRequested = this.requested;
-
-                if (currentRequested == STATE_TERMINATED) {
-                    // we should not override terminal state
-                    nextRequested = STATE_TERMINATED;
-                    break;
-                }
-
-                if (nextRequested == Long.MAX_VALUE) {
-                    // we should state that it max value has already been requested, so no need to loop anymore
-                    toUpdate = STATE_WAS_REQUESTED_MAX;
-                } else {
-                    // subtract the requestN from the latest requested state
-                    toUpdate = currentRequested - nextRequested;
-                }
-
-                if (REQUESTED.compareAndSet(this, nextRequested, toUpdate)) {
-                    nextRequested = toUpdate;
-                    break;
-                }
-            }
-
-            if (nextRequested == STATE_WAS_REQUESTED_MAX) {
-                return;
-            }
-
-            if (nextRequested == STATE_TERMINATED) {
-                final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
-                sender.onNext(cancelFrame);
-
-                return;
-            }
-
-            if (nextRequested == 0) {
-                return;
-            }
-        }
+    public void cancel() {
+      this.activeSubscriptions.remove(this.parent.streamId, this);
+      this.s.cancel();
     }
-
-    @Override
-    public final void cancel() {
-        final long state = REQUESTED.getAndSet(this, STATE_TERMINATED);
-        if (state != STATE_TERMINATED && state <= 0) {
-            if (state == STATE_SUBSCRIBED) {
-                // no need to send anything, since the first request has not happened
-                ReferenceCountUtil.safeRelease(this.firstPayload);
-            } else {
-                final int streamId = this.streamId;
-                final ByteBuf cancelFrame = CancelFrameFlyweight.encode(this.allocator, streamId);
-
-                this.activeStreams.remove(streamId, this);
-                this.sendProcessor.onNext(cancelFrame);
-            }
-        }
-    }
-
-    @Override
-    @Nullable
-    public Object scanUnsafe(Attr key) {
-        // touch guard
-        long state = this.requested;
-
-        if (key == Attr.TERMINATED) return state == STATE_TERMINATED;
-        if (key == Attr.REQUESTED_FROM_DOWNSTREAM) return state;
-
-        return null;
-    }
-
-    @Override
-    @NonNull
-    public String stepName() {
-        return "source(UnicastRequestStreamFlux)";
-    }
-
-    static final class UpstreamSubscriber implements CoreSubscriber<Payload> {
-
-        @Override
-        public void onSubscribe(Subscription s) {
-
-        }
-
-        @Override
-        public void onNext(Payload payload) {
-
-        }
-
-        @Override
-        public void onError(Throwable t) {
-
-        }
-
-        @Override
-        public void onComplete() {
-
-        }
-    }
+  }
 }
