@@ -3,11 +3,13 @@ package io.rsocket;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
+import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.fragmentation.FragmentationUtils;
 import io.rsocket.frame.CancelFrameFlyweight;
 import io.rsocket.frame.ErrorFrameFlyweight;
+import io.rsocket.frame.FrameLengthFlyweight;
 import io.rsocket.frame.FrameType;
 import io.rsocket.frame.PayloadFrameFlyweight;
 import io.rsocket.frame.RequestChannelFrameFlyweight;
@@ -92,6 +94,10 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
 
   @Override
   public void onNext(Payload p) {
+    if (this.isTerminated()) {
+      ReferenceCountUtil.safeRelease(p);
+      return;
+    }
     final UnboundedProcessor<ByteBuf> sender = this.sendProcessor;
     final ByteBufAllocator allocator = this.allocator;
     final IntObjectMap<CoreSubscriber<? super Payload>> as = this.activeStreams;
@@ -101,6 +107,14 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
     int streamId = this.streamId;
     if (this.first) {
       this.first = false;
+
+      if (p.refCnt() <= 0) {
+        final Throwable t = new IllegalReferenceCountException(0);
+        this.requested = STATE_TERMINATED;
+        this.connector.s.cancel();
+        this.connector.actual.onError(t);
+        return;
+      }
 
       boolean firstLoop = true;
       long requested;
@@ -127,18 +141,20 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
         if (firstLoop) {
           final Throwable throwable = parent.checkAvailable();
           if (throwable != null) {
-            this.connector.onError(throwable);
+            this.requested = STATE_TERMINATED;
+            this.connector.s.cancel();
+            this.connector.actual.onError(throwable);
             return;
           }
           try {
             final boolean hasMetadata = p.hasMetadata();
-            final ByteBuf slicedData = p.data().retainedSlice();
 
             streamId = this.streamIdSupplier.nextStreamId(as);
 
             this.streamId = streamId;
 
             if (mtu > 0) {
+              final ByteBuf slicedData = p.data().retainedSlice();
               final ByteBuf slicedMetadata =
                   hasMetadata ? p.metadata().retainedSlice() : Unpooled.EMPTY_BUFFER;
 
@@ -163,7 +179,22 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
                 sender.onNext(following);
               }
             } else {
-              final ByteBuf slicedMetadata = hasMetadata ? p.metadata().retainedSlice() : null;
+              final ByteBuf data = p.data();
+              final ByteBuf metadata = p.metadata();
+
+              if (((data.readableBytes() + (hasMetadata ? metadata.readableBytes() : 0))
+                      & ~FrameLengthFlyweight.FRAME_LENGTH_MASK)
+                  != 0) {
+                final Throwable t = new IllegalArgumentException("Too Big Payload size");
+                this.requested = STATE_TERMINATED;
+                this.connector.s.cancel();
+                this.connector.actual.onError(t);
+                ReferenceCountUtil.safeRelease(p);
+                return;
+              }
+
+              final ByteBuf slicedData = data.retainedSlice();
+              final ByteBuf slicedMetadata = hasMetadata ? metadata.retainedSlice() : null;
 
               final ByteBuf requestFrame =
                   RequestChannelFrameFlyweight.encode(
@@ -205,11 +236,19 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
         firstLoop = false;
       }
     } else {
+      if (p.refCnt() <= 0) {
+        final Throwable t = new IllegalReferenceCountException(0);
+        final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
+        sender.onNext(cancelFrame);
+        this.connector.onError(t);
+        return;
+      }
+
       try {
         final boolean hasMetadata = p.hasMetadata();
-        final ByteBuf slicedData = p.data().retainedSlice();
 
         if (mtu > 0) {
+          final ByteBuf slicedData = p.data().retainedSlice();
           final ByteBuf slicedMetadata =
               hasMetadata ? p.metadata().retainedSlice() : Unpooled.EMPTY_BUFFER;
 
@@ -225,7 +264,22 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
             sender.onNext(following);
           }
         } else {
-          final ByteBuf slicedMetadata = hasMetadata ? p.metadata().retainedSlice() : null;
+          final ByteBuf data = p.data();
+          final ByteBuf metadata = p.metadata();
+
+          if (((data.readableBytes() + (hasMetadata ? metadata.readableBytes() : 0))
+                  & ~FrameLengthFlyweight.FRAME_LENGTH_MASK)
+              != 0) {
+            final Throwable t = new IllegalArgumentException("Too Big Payload size");
+            final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
+            sender.onNext(cancelFrame);
+            this.connector.onError(t);
+            ReferenceCountUtil.safeRelease(p);
+            return;
+          }
+
+          final ByteBuf slicedData = data.retainedSlice();
+          final ByteBuf slicedMetadata = hasMetadata ? metadata.retainedSlice() : null;
 
           final ByteBuf nextFrame =
               PayloadFrameFlyweight.encode(

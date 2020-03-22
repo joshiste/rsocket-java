@@ -3,10 +3,12 @@ package io.rsocket;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
+import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.fragmentation.FragmentationUtils;
 import io.rsocket.frame.CancelFrameFlyweight;
+import io.rsocket.frame.FrameLengthFlyweight;
 import io.rsocket.frame.FrameType;
 import io.rsocket.frame.RequestResponseFrameFlyweight;
 import io.rsocket.internal.UnboundedProcessor;
@@ -118,17 +120,32 @@ final class UnicastRequestResponseMono extends Mono<Payload>
 
   @Override
   public void subscribe(CoreSubscriber<? super Payload> actual) {
-    Objects.requireNonNull(actual, "subscribe");
+    final Payload p = this.payload;
 
-    if (state == STATE_UNSUBSCRIBED
-        && STATE.compareAndSet(this, STATE_UNSUBSCRIBED, STATE_SUBSCRIBED)) {
-      this.actual = actual;
-      // call onSubscribe if has value in the result or no result delivered so far
-      actual.onSubscribe(this);
+    if (p.refCnt() > 0) {
+      if (this.state == STATE_UNSUBSCRIBED
+          && STATE.compareAndSet(this, STATE_UNSUBSCRIBED, STATE_SUBSCRIBED)) {
+        this.actual = actual;
+
+        if (this.mtu == 0
+            && ((p.data().readableBytes() + (p.hasMetadata() ? p.metadata().readableBytes() : 0))
+                    & ~FrameLengthFlyweight.FRAME_LENGTH_MASK)
+                != 0) {
+          Operators.error(actual, new IllegalArgumentException("Too Big Payload size"));
+          ReferenceCountUtil.safeRelease(p);
+          return;
+        }
+
+        // call onSubscribe if has value in the result or no result delivered so far
+        actual.onSubscribe(this);
+      } else {
+        Operators.error(
+            actual,
+            new IllegalStateException(
+                "UnicastRequestResponseMono allows only a single Subscriber"));
+      }
     } else {
-      Operators.error(
-          actual,
-          new IllegalStateException("UnicastRequestResponseMono allows only a single Subscriber"));
+      Operators.error(actual, new IllegalReferenceCountException(0));
     }
   }
 

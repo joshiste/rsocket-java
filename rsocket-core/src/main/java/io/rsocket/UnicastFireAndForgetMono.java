@@ -56,22 +56,25 @@ final class UnicastFireAndForgetMono extends Mono<Void> implements Scannable {
 
   @Override
   public void subscribe(CoreSubscriber<? super Void> actual) {
-    final Throwable throwable = parent.checkAvailable();
     final Payload p = this.payload;
 
-    if (throwable == null) {
-      if (p.refCnt() > 0) {
-        if (once == 0 && ONCE.compareAndSet(this, 0, 1)) {
-          try {
-            final boolean hasMetadata = p.hasMetadata();
-            final ByteBuf data = p.data();
-            final ByteBuf metadata = hasMetadata ? p.metadata() : null;
-            final int mtu = this.mtu;
+    if (p.refCnt() > 0) {
+      if (once == 0 && ONCE.compareAndSet(this, 0, 1)) {
+        try {
+          final boolean hasMetadata = p.hasMetadata();
+          final ByteBuf data = p.data();
+          final ByteBuf metadata = hasMetadata ? p.metadata() : null;
+          final int mtu = this.mtu;
 
-            if (mtu == 0
-                && data.readableBytes() + (hasMetadata ? metadata.readableBytes() : 0)
-                    > FrameLengthFlyweight.FRAME_LENGTH_SIZE) {
-              Operators.error(actual, new IllegalArgumentException("Too Big Payload size"));
+          if (mtu == 0
+              && ((data.readableBytes() + (hasMetadata ? metadata.readableBytes() : 0))
+                      & ~FrameLengthFlyweight.FRAME_LENGTH_MASK)
+                  != 0) {
+            Operators.error(actual, new IllegalArgumentException("Too Big Payload size"));
+          } else {
+            final Throwable throwable = parent.checkAvailable();
+            if (throwable != null) {
+              Operators.error(actual, throwable);
             } else {
               final int streamId = this.streamIdSupplier.nextStreamId(this.activeStreams);
               final UnboundedProcessor<ByteBuf> sender = this.sendProcessor;
@@ -109,24 +112,20 @@ final class UnicastFireAndForgetMono extends Mono<Void> implements Scannable {
 
               Operators.complete(actual);
             }
-          } catch (IllegalReferenceCountException e) {
-            Operators.error(actual, e);
           }
-        } else {
-          Operators.error(
-              actual,
-              new IllegalStateException(
-                  "UnicastFireAndForgetMono allows only a single Subscriber"));
+        } catch (Throwable e) {
+          Operators.error(actual, e);
         }
       } else {
-        Operators.error(actual, new IllegalReferenceCountException(0));
-        return;
+        Operators.error(
+            actual,
+            new IllegalStateException("UnicastFireAndForgetMono allows only a single Subscriber"));
       }
-    } else {
-      Operators.error(actual, throwable);
-    }
 
-    ReferenceCountUtil.safeRelease(p);
+      ReferenceCountUtil.safeRelease(p);
+    } else {
+      Operators.error(actual, new IllegalReferenceCountException(0));
+    }
   }
 
   @Override

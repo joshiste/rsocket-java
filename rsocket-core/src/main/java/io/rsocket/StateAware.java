@@ -1,6 +1,6 @@
 package io.rsocket;
 
-public interface StateAware {
+interface StateAware {
 
   Throwable checkAvailable();
 }

@@ -33,6 +33,7 @@ import io.rsocket.frame.LeaseFrameFlyweight;
 import io.rsocket.frame.SetupFrameFlyweight;
 import io.rsocket.frame.decoder.PayloadDecoder;
 import io.rsocket.internal.ClientServerInputMultiplexer;
+import io.rsocket.internal.subscriber.AssertSubscriber;
 import io.rsocket.lease.*;
 import io.rsocket.plugins.PluginRegistry;
 import io.rsocket.test.util.TestClientTransport;
@@ -188,7 +189,12 @@ class RSocketLeaseTest {
   void requesterDepletedAllowedLeaseRequestsAreRejected(
       Function<RSocket, Publisher<?>> interaction) {
     requesterLeaseHandler.receive(leaseFrame(5_000, 1, Unpooled.EMPTY_BUFFER));
-    interaction.apply(rSocketRequester);
+
+    AssertSubscriber assertSubscriber = AssertSubscriber.create();
+    interaction.apply(rSocketRequester).subscribe(assertSubscriber);
+
+    assertSubscriber.assertSubscribed();
+    assertSubscriber.assertNoError();
 
     Flux.from(interaction.apply(rSocketRequester))
         .as(StepVerifier::create)
