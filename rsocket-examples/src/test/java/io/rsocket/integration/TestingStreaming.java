@@ -151,6 +151,7 @@ public class TestingStreaming {
                           @Override
                           public Flux<Payload> requestStream(Payload payload) {
                             return Flux.range(1, 10_000)
+                                .log(".remote-service")
                                 .map(l -> DefaultPayload.create("l -> " + l))
                                 .cast(Payload.class);
                           }
@@ -162,7 +163,7 @@ public class TestingStreaming {
               .start()
               .block();
 
-      consumer("1").blockLast();
+      consumer("1").log(".client-service").blockLast();
 
     } finally {
       server.dispose();

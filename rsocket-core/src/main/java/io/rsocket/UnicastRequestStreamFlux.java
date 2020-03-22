@@ -242,7 +242,12 @@ final class UnicastRequestStreamFlux extends Flux<Payload>
 
             final ByteBuf requestFrame =
                 RequestStreamFrameFlyweight.encode(
-                    allocator, streamId, false, n, slicedMetadata, slicedData);
+                    allocator,
+                    streamId,
+                    false,
+                    (int) (nextRequested & Integer.MAX_VALUE),
+                    slicedMetadata,
+                    slicedData);
 
             as.put(streamId, this);
             sender.onNext(requestFrame);
@@ -290,7 +295,7 @@ final class UnicastRequestStreamFlux extends Flux<Payload>
           toUpdate = currentRequested - nextRequested;
         }
 
-        if (REQUESTED.compareAndSet(this, nextRequested, toUpdate)) {
+        if (REQUESTED.compareAndSet(this, currentRequested, toUpdate)) {
           nextRequested = toUpdate;
           break;
         }

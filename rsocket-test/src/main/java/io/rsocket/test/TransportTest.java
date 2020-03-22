@@ -26,11 +26,13 @@ import io.rsocket.util.DefaultPayload;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.time.Duration;
+import java.util.concurrent.CancellationException;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.zip.GZIPInputStream;
+import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -144,7 +146,11 @@ public interface TransportTest {
         .requestChannel(Flux.empty())
         .as(StepVerifier::create)
         .expectNextCount(0)
-        .expectComplete()
+        .expectErrorSatisfies(
+            t ->
+                Assertions.assertThat(t)
+                    .isInstanceOf(CancellationException.class)
+                    .hasMessage("Empty Source"))
         .verify(getTimeout());
   }
 

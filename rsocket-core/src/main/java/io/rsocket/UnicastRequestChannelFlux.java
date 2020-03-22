@@ -198,7 +198,13 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
 
               final ByteBuf requestFrame =
                   RequestChannelFrameFlyweight.encode(
-                      allocator, streamId, false, false, requested, slicedMetadata, slicedData);
+                      allocator,
+                      streamId,
+                      false,
+                      false,
+                      (int) (requested & Integer.MAX_VALUE),
+                      slicedMetadata,
+                      slicedData);
 
               as.put(streamId, this.connector);
               ass.put(streamId, this.connector);
