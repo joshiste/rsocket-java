@@ -25,7 +25,7 @@ import reactor.util.annotation.NonNull;
 import reactor.util.annotation.Nullable;
 import reactor.util.context.Context;
 
-final class UnicastRequestStreamFlux extends Flux<Payload>
+final class RequestStreamFlux extends Flux<Payload>
     implements CoreSubscriber<Payload>, Subscription, Scannable {
 
   final ByteBufAllocator allocator;
@@ -42,13 +42,13 @@ final class UnicastRequestStreamFlux extends Flux<Payload>
   static final long STATE_TERMINATED = Long.MIN_VALUE;
 
   volatile long requested;
-  static final AtomicLongFieldUpdater<UnicastRequestStreamFlux> REQUESTED =
-      AtomicLongFieldUpdater.newUpdater(UnicastRequestStreamFlux.class, "requested");
+  static final AtomicLongFieldUpdater<RequestStreamFlux> REQUESTED =
+      AtomicLongFieldUpdater.newUpdater(RequestStreamFlux.class, "requested");
 
   int streamId;
   CoreSubscriber<? super Payload> actual;
 
-  UnicastRequestStreamFlux(
+  RequestStreamFlux(
       ByteBufAllocator allocator,
       Payload payload,
       int mtu,
@@ -99,9 +99,8 @@ final class UnicastRequestStreamFlux extends Flux<Payload>
 
   @Override
   public final void onError(Throwable cause) {
-    Objects.requireNonNull(cause, "onError cannot be null");
-
-    if (this.requested == STATE_TERMINATED) {
+    if (this.requested == STATE_TERMINATED
+        || REQUESTED.getAndSet(this, STATE_TERMINATED) == STATE_TERMINATED) {
       Operators.onErrorDropped(cause, currentContext());
       return;
     }
@@ -143,8 +142,7 @@ final class UnicastRequestStreamFlux extends Flux<Payload>
         actual.onSubscribe(this);
       } else {
         Operators.error(
-            actual,
-            new IllegalStateException("UnicastRequestStreamFlux allows only a single Subscriber"));
+            actual, new IllegalStateException("RequestStreamFlux allows only a single Subscriber"));
       }
     } else {
       Operators.error(actual, new IllegalReferenceCountException(0));
@@ -234,7 +232,7 @@ final class UnicastRequestStreamFlux extends Flux<Payload>
             while (slicedData.isReadable() || slicedMetadata.isReadable()) {
               final ByteBuf following =
                   FragmentationUtils.encodeFollowsFragment(
-                      allocator, mtu, streamId, slicedMetadata, slicedData);
+                      allocator, mtu, streamId, false, slicedMetadata, slicedData);
               sender.onNext(following);
             }
           } else {
@@ -350,6 +348,6 @@ final class UnicastRequestStreamFlux extends Flux<Payload>
   @Override
   @NonNull
   public String stepName() {
-    return "source(UnicastRequestStreamFlux)";
+    return "source(RequestStreamFlux)";
   }
 }

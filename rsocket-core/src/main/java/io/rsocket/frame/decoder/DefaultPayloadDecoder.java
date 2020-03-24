@@ -4,7 +4,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.rsocket.Payload;
 import io.rsocket.frame.*;
-import io.rsocket.util.ByteBufPayload;
+import io.rsocket.util.DefaultPayload;
 import java.nio.ByteBuffer;
 
 /** Default Frame decoder that copies the frames contents for easy of use. */
@@ -53,6 +53,6 @@ class DefaultPayloadDecoder implements PayloadDecoder {
     metadata.put(m.nioBuffer());
     metadata.flip();
 
-    return ByteBufPayload.create(data, metadata);
+    return DefaultPayload.create(data, metadata);
   }
 }

@@ -14,7 +14,12 @@ import io.rsocket.frame.RequestStreamFrameFlyweight;
 public class FragmentationUtils {
 
   public static ByteBuf encodeFollowsFragment(
-      ByteBufAllocator allocator, int mtu, int streamId, ByteBuf metadata, ByteBuf data) {
+      ByteBufAllocator allocator,
+      int mtu,
+      int streamId,
+      boolean complete,
+      ByteBuf metadata,
+      ByteBuf data) {
     // subtract the header bytes
     int remaining = mtu - FrameHeaderFlyweight.size();
 
@@ -35,7 +40,7 @@ public class FragmentationUtils {
 
     boolean follows = data.isReadable() || metadata.isReadable();
     return PayloadFrameFlyweight.encode(
-        allocator, streamId, follows, false, true, metadataFragment, dataFragment);
+        allocator, streamId, follows, (!follows && complete), true, metadataFragment, dataFragment);
   }
 
   public static ByteBuf encodeFirstFragment(
@@ -75,14 +80,11 @@ public class FragmentationUtils {
         return PayloadFrameFlyweight.encode(
             allocator, streamId, true, false, false, metadataFragment, dataFragment);
       case NEXT:
-        return PayloadFrameFlyweight.encode(
-            allocator, streamId, true, false, true, metadataFragment, dataFragment);
+        // see https://github.com/rsocket/rsocket/blob/master/Protocol.md#handling-the-unexpected
+        // point 7
       case NEXT_COMPLETE:
         return PayloadFrameFlyweight.encode(
-            allocator, streamId, true, true, true, metadataFragment, dataFragment);
-      case COMPLETE:
-        return PayloadFrameFlyweight.encode(
-            allocator, streamId, true, true, false, metadataFragment, dataFragment);
+            allocator, streamId, true, false, true, metadataFragment, dataFragment);
       default:
         throw new IllegalStateException("unsupported fragment type: " + frameType);
     }

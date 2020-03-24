@@ -475,7 +475,8 @@ public class RSocketFactory {
                                     wrappedRSocketHandler,
                                     payloadDecoder,
                                     errorConsumer,
-                                    responderLeaseHandler);
+                                    responderLeaseHandler,
+                                    mtu);
 
                             return wrappedConnection
                                 .sendOne(setupFrame)
@@ -781,7 +782,8 @@ public class RSocketFactory {
                                 wrappedRSocketHandler,
                                 payloadDecoder,
                                 errorConsumer,
-                                responderLeaseHandler);
+                                responderLeaseHandler,
+                                mtu);
                       })
                   .doFinally(signalType -> setupPayload.release())
                   .then();

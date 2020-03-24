@@ -178,7 +178,7 @@ public interface TransportTest {
         .verify(getTimeout());
   }
 
-  @DisplayName("makes 1 requestChannel request with 2,000 large payloads")
+  @DisplayName("makes 1 requestChannel request with 200 large payloads")
   @Test
   default void largePayloadRequestChannel200() {
     Flux<Payload> payloads = Flux.range(0, 200).map(__ -> LARGE_PAYLOAD);

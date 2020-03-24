@@ -28,7 +28,7 @@ import reactor.util.annotation.NonNull;
 import reactor.util.annotation.Nullable;
 import reactor.util.context.Context;
 
-final class UnicastRequestChannelFlux extends Flux<Payload>
+final class RequestChannelFlux extends Flux<Payload>
     implements CoreSubscriber<Payload>, Subscription, Scannable {
 
   final ByteBufAllocator allocator;
@@ -46,15 +46,15 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
   static final long STATE_TERMINATED = Long.MIN_VALUE;
 
   volatile long requested;
-  static final AtomicLongFieldUpdater<UnicastRequestChannelFlux> REQUESTED =
-      AtomicLongFieldUpdater.newUpdater(UnicastRequestChannelFlux.class, "requested");
+  static final AtomicLongFieldUpdater<RequestChannelFlux> REQUESTED =
+      AtomicLongFieldUpdater.newUpdater(RequestChannelFlux.class, "requested");
 
   int streamId;
   InnerConnectorSubscriber connector;
 
   boolean first = true;
 
-  UnicastRequestChannelFlux(
+  RequestChannelFlux(
       ByteBufAllocator allocator,
       Flux<Payload> payloadPublisher,
       int mtu,
@@ -175,7 +175,13 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
               while (slicedData.isReadable() || slicedMetadata.isReadable()) {
                 final ByteBuf following =
                     FragmentationUtils.encodeFollowsFragment(
-                        allocator, mtu, streamId, slicedMetadata, slicedData);
+                        allocator,
+                        mtu,
+                        streamId,
+                        false, // TODO: Should be a different flag in case of the scalar source or
+                        // sync source of a single element
+                        slicedMetadata,
+                        slicedData);
                 sender.onNext(following);
               }
             } else {
@@ -201,7 +207,8 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
                       allocator,
                       streamId,
                       false,
-                      false,
+                      false, // TODO: Should be a different flag in case of the scalar source or
+                      // sync source of a single element
                       (int) (requested & Integer.MAX_VALUE),
                       slicedMetadata,
                       slicedData);
@@ -266,7 +273,7 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
           while (slicedData.isReadable() || slicedMetadata.isReadable()) {
             final ByteBuf following =
                 FragmentationUtils.encodeFollowsFragment(
-                    allocator, mtu, streamId, slicedMetadata, slicedData);
+                    allocator, mtu, streamId, false, slicedMetadata, slicedData);
             sender.onNext(following);
           }
         } else {
@@ -356,8 +363,7 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
       this.payloadPublisher.subscribe(this);
     } else {
       Operators.error(
-          actual,
-          new IllegalStateException("UnicastRequestStreamFlux allows only a single Subscriber"));
+          actual, new IllegalStateException("RequestChannelFlux allows only a single Subscriber"));
     }
   }
 
@@ -442,7 +448,7 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
   @Override
   @NonNull
   public String stepName() {
-    return "source(UnicastRequestChannelFlux)";
+    return "source(RequestChannelFlux)";
   }
 
   // this should be stored to listen for requestN frames from the Responder side
@@ -450,7 +456,7 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
   // and should deliver them to the responder one
   static final class InnerConnectorSubscriber implements CoreSubscriber<Payload>, Subscription {
 
-    final UnicastRequestChannelFlux parent;
+    final RequestChannelFlux parent;
     final CoreSubscriber<? super Payload> actual;
     final IntObjectMap<CoreSubscriber<? super Payload>> activeStreams;
     final IntObjectMap<Subscription> activeSubscriptions;
@@ -458,7 +464,7 @@ final class UnicastRequestChannelFlux extends Flux<Payload>
     Subscription s;
 
     InnerConnectorSubscriber(
-        UnicastRequestChannelFlux parent,
+        RequestChannelFlux parent,
         CoreSubscriber<? super Payload> actual,
         IntObjectMap<CoreSubscriber<? super Payload>> activeStreams,
         IntObjectMap<Subscription> activeSubscriptions) {

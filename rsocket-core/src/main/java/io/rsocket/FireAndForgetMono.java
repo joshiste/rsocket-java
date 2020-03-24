@@ -21,13 +21,13 @@ import reactor.core.publisher.Operators;
 import reactor.util.annotation.NonNull;
 import reactor.util.annotation.Nullable;
 
-final class UnicastFireAndForgetMono extends Mono<Void> implements Scannable {
+final class FireAndForgetMono extends Mono<Void> implements Scannable {
 
   volatile int once;
 
   @SuppressWarnings("rawtypes")
-  static final AtomicIntegerFieldUpdater<UnicastFireAndForgetMono> ONCE =
-      AtomicIntegerFieldUpdater.newUpdater(UnicastFireAndForgetMono.class, "once");
+  static final AtomicIntegerFieldUpdater<FireAndForgetMono> ONCE =
+      AtomicIntegerFieldUpdater.newUpdater(FireAndForgetMono.class, "once");
 
   final ByteBufAllocator allocator;
   final Payload payload;
@@ -37,7 +37,7 @@ final class UnicastFireAndForgetMono extends Mono<Void> implements Scannable {
   final IntObjectMap<?> activeStreams;
   final UnboundedProcessor<ByteBuf> sendProcessor;
 
-  UnicastFireAndForgetMono(
+  FireAndForgetMono(
       @NonNull ByteBufAllocator allocator,
       @NonNull Payload payload,
       int mtu,
@@ -98,7 +98,7 @@ final class UnicastFireAndForgetMono extends Mono<Void> implements Scannable {
                 while (slicedData.isReadable() || slicedMetadata.isReadable()) {
                   ByteBuf following =
                       FragmentationUtils.encodeFollowsFragment(
-                          allocator, mtu, streamId, slicedMetadata, slicedData);
+                          allocator, mtu, streamId, false, slicedMetadata, slicedData);
                   sender.onNext(following);
                 }
               } else {

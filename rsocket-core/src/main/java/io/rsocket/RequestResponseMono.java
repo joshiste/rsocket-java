@@ -24,7 +24,7 @@ import reactor.util.annotation.NonNull;
 import reactor.util.annotation.Nullable;
 import reactor.util.context.Context;
 
-final class UnicastRequestResponseMono extends Mono<Payload>
+final class RequestResponseMono extends Mono<Payload>
     implements CoreSubscriber<Payload>, Subscription, Scannable {
 
   final ByteBufAllocator allocator;
@@ -41,13 +41,13 @@ final class UnicastRequestResponseMono extends Mono<Payload>
   static final int STATE_TERMINATED = 3;
 
   volatile int state;
-  static final AtomicIntegerFieldUpdater<UnicastRequestResponseMono> STATE =
-      AtomicIntegerFieldUpdater.newUpdater(UnicastRequestResponseMono.class, "state");
+  static final AtomicIntegerFieldUpdater<RequestResponseMono> STATE =
+      AtomicIntegerFieldUpdater.newUpdater(RequestResponseMono.class, "state");
 
   int streamId;
   CoreSubscriber<? super Payload> actual;
 
-  UnicastRequestResponseMono(
+  RequestResponseMono(
       ByteBufAllocator allocator,
       Payload payload,
       int mtu,
@@ -141,8 +141,7 @@ final class UnicastRequestResponseMono extends Mono<Payload>
       } else {
         Operators.error(
             actual,
-            new IllegalStateException(
-                "UnicastRequestResponseMono allows only a single Subscriber"));
+            new IllegalStateException("RequestResponseMono allows only a single Subscriber"));
       }
     } else {
       Operators.error(actual, new IllegalReferenceCountException(0));
@@ -187,7 +186,7 @@ final class UnicastRequestResponseMono extends Mono<Payload>
           while (slicedData.isReadable() || slicedMetadata.isReadable()) {
             final ByteBuf following =
                 FragmentationUtils.encodeFollowsFragment(
-                    allocator, mtu, streamId, slicedMetadata, slicedData);
+                    allocator, mtu, streamId, false, slicedMetadata, slicedData);
             sender.onNext(following);
           }
         } else {
@@ -246,6 +245,6 @@ final class UnicastRequestResponseMono extends Mono<Payload>
   @Override
   @NonNull
   public String stepName() {
-    return "source(UnicastRequestResponseMono)";
+    return "source(RequestResponseMono)";
   }
 }

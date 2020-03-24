@@ -21,6 +21,7 @@ import io.netty.buffer.ByteBufAllocator;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.exceptions.ApplicationErrorException;
+import io.rsocket.fragmentation.ReassemblyUtils;
 import io.rsocket.frame.*;
 import io.rsocket.frame.decoder.PayloadDecoder;
 import io.rsocket.internal.RateLimitableRequestPublisher;
@@ -35,7 +36,6 @@ import org.reactivestreams.Subscription;
 import reactor.core.Disposable;
 import reactor.core.Exceptions;
 import reactor.core.publisher.*;
-import reactor.util.concurrent.Queues;
 
 /** Responder side of RSocket. Receives {@link ByteBuf}s from a peer's {@link RSocketRequester} */
 class RSocketResponder implements ResponderRSocket {
@@ -53,6 +53,9 @@ class RSocketResponder implements ResponderRSocket {
 
   private final UnboundedProcessor<ByteBuf> sendProcessor;
   private final ByteBufAllocator allocator;
+  private final FireAndForgetSubscriber noOpFireAndForgetSubscriber;
+
+  private final int mtu;
 
   RSocketResponder(
       ByteBufAllocator allocator,
@@ -60,7 +63,8 @@ class RSocketResponder implements ResponderRSocket {
       RSocket requestHandler,
       PayloadDecoder payloadDecoder,
       Consumer<Throwable> errorConsumer,
-      ResponderLeaseHandler leaseHandler) {
+      ResponderLeaseHandler leaseHandler,
+      int mtu) {
     this.allocator = allocator;
     this.connection = connection;
 
@@ -78,6 +82,8 @@ class RSocketResponder implements ResponderRSocket {
     // DO NOT Change the order here. The Send processor must be subscribed to before receiving
     // connections
     this.sendProcessor = new UnboundedProcessor<>();
+    this.mtu = mtu;
+    this.noOpFireAndForgetSubscriber = new FireAndForgetSubscriber(errorConsumer);
 
     connection
         .send(sendProcessor)
@@ -293,10 +299,10 @@ class RSocketResponder implements ResponderRSocket {
       FrameType frameType = FrameHeaderFlyweight.frameType(frame);
       switch (frameType) {
         case REQUEST_FNF:
-          handleFireAndForget(streamId, fireAndForget(payloadDecoder.apply(frame)));
+          handleFireAndForget(streamId, frame);
           break;
         case REQUEST_RESPONSE:
-          handleRequestResponse(streamId, requestResponse(payloadDecoder.apply(frame)));
+          handleRequestResponse(streamId, frame);
           break;
         case CANCEL:
           handleCancelFrame(streamId);
@@ -306,8 +312,7 @@ class RSocketResponder implements ResponderRSocket {
           break;
         case REQUEST_STREAM:
           int streamInitialRequestN = RequestStreamFrameFlyweight.initialRequestN(frame);
-          Payload streamPayload = payloadDecoder.apply(frame);
-          handleStream(streamId, requestStream(streamPayload), streamInitialRequestN);
+          handleStream(streamId, frame, streamInitialRequestN);
           break;
         case REQUEST_CHANNEL:
           int channelInitialRequestN = RequestChannelFrameFlyweight.initialRequestN(frame);
@@ -362,120 +367,96 @@ class RSocketResponder implements ResponderRSocket {
     }
   }
 
-  private void handleFireAndForget(int streamId, Mono<Void> result) {
-    result.subscribe(
-        new BaseSubscriber<Void>() {
-          @Override
-          protected void hookOnSubscribe(Subscription subscription) {
-            sendingSubscriptions.put(streamId, subscription);
-            subscription.request(Long.MAX_VALUE);
-          }
-
-          @Override
-          protected void hookOnError(Throwable throwable) {
-            errorConsumer.accept(throwable);
-          }
-
-          @Override
-          protected void hookFinally(SignalType type) {
-            sendingSubscriptions.remove(streamId);
-          }
-        });
+  private void handleFireAndForget(int streamId, ByteBuf frame) {
+    final IntObjectMap<Subscription> activeStreams = this.sendingSubscriptions;
+    if (activeStreams.containsKey(streamId)) {
+      if (FrameHeaderFlyweight.hasFollows(frame)) {
+        FireAndForgetSubscriber subscriber =
+            new FireAndForgetSubscriber(
+                streamId,
+                ReassemblyUtils.dataAndMetadata(frame),
+                allocator,
+                payloadDecoder,
+                errorConsumer,
+                activeStreams,
+                this);
+        if (activeStreams.putIfAbsent(streamId, subscriber) != null) {
+          subscriber.cancel();
+        }
+      } else {
+        fireAndForget(this.payloadDecoder.apply(frame)).subscribe(this.noOpFireAndForgetSubscriber);
+      }
+    }
   }
 
-  private void handleRequestResponse(int streamId, Mono<Payload> response) {
-    response.subscribe(
-        new BaseSubscriber<Payload>() {
-          private boolean isEmpty = true;
-
-          @Override
-          protected void hookOnSubscribe(Subscription subscription) {
-            sendingSubscriptions.put(streamId, subscription);
-            subscription.request(Long.MAX_VALUE);
-          }
-
-          @Override
-          protected void hookOnNext(Payload payload) {
-            if (isEmpty) {
-              isEmpty = false;
-            }
-
-            ByteBuf byteBuf;
-            try {
-              byteBuf = PayloadFrameFlyweight.encodeNextComplete(allocator, streamId, payload);
-            } catch (Throwable t) {
-              payload.release();
-              throw Exceptions.propagate(t);
-            }
-
-            payload.release();
-
-            sendProcessor.onNext(byteBuf);
-          }
-
-          @Override
-          protected void hookOnError(Throwable throwable) {
-            handleError(streamId, throwable);
-          }
-
-          @Override
-          protected void hookOnComplete() {
-            if (isEmpty) {
-              sendProcessor.onNext(PayloadFrameFlyweight.encodeComplete(allocator, streamId));
-            }
-          }
-
-          @Override
-          protected void hookFinally(SignalType type) {
-            sendingSubscriptions.remove(streamId);
-          }
-        });
+  private void handleRequestResponse(int streamId, ByteBuf frame) {
+    final IntObjectMap<Subscription> activeStreams = this.sendingSubscriptions;
+    if (activeStreams.containsKey(streamId)) {
+      if (FrameHeaderFlyweight.hasFollows(frame)) {
+        RequestResponseSubscriber subscriber =
+            new RequestResponseSubscriber(
+                streamId,
+                this.allocator,
+                this.payloadDecoder,
+                ReassemblyUtils.dataAndMetadata(frame),
+                this.mtu,
+                this.errorConsumer,
+                this.sendingSubscriptions,
+                this.sendProcessor,
+                this);
+        if (activeStreams.putIfAbsent(streamId, subscriber) != null) {
+          subscriber.cancel();
+        }
+      } else {
+        RequestResponseSubscriber subscriber =
+            new RequestResponseSubscriber(
+                streamId,
+                this.allocator,
+                this.mtu,
+                this.errorConsumer,
+                this.sendingSubscriptions,
+                this.sendProcessor);
+        if (activeStreams.putIfAbsent(streamId, subscriber) == null) {
+          this.requestResponse(payloadDecoder.apply(frame)).subscribe(subscriber);
+        }
+      }
+    }
   }
 
-  private void handleStream(int streamId, Flux<Payload> response, int initialRequestN) {
-    response
-        .transform(
-            frameFlux -> {
-              RateLimitableRequestPublisher<Payload> payloads =
-                  RateLimitableRequestPublisher.wrap(frameFlux, Queues.SMALL_BUFFER_SIZE);
-              sendingLimitableSubscriptions.put(streamId, payloads);
-              payloads.request(
-                  initialRequestN >= Integer.MAX_VALUE ? Long.MAX_VALUE : initialRequestN);
-              return payloads;
-            })
-        .subscribe(
-            new BaseSubscriber<Payload>() {
-
-              @Override
-              protected void hookOnNext(Payload payload) {
-                ByteBuf byteBuf;
-                try {
-                  byteBuf = PayloadFrameFlyweight.encodeNext(allocator, streamId, payload);
-                } catch (Throwable t) {
-                  payload.release();
-                  throw Exceptions.propagate(t);
-                }
-
-                payload.release();
-
-                sendProcessor.onNext(byteBuf);
-              }
-
-              @Override
-              protected void hookOnComplete() {
-                sendProcessor.onNext(PayloadFrameFlyweight.encodeComplete(allocator, streamId));
-              }
-
-              @Override
-              protected void hookOnError(Throwable throwable) {
-                handleError(streamId, throwable);
-              }
-
-              @Override
-              protected void hookFinally(SignalType type) {
-                sendingLimitableSubscriptions.remove(streamId);
-              }
-            });
+  private void handleStream(int streamId, ByteBuf frame, int initialRequestN) {
+    final IntObjectMap<Subscription> activeStreams = this.sendingSubscriptions;
+    if (activeStreams.containsKey(streamId)) {
+      if (FrameHeaderFlyweight.hasFollows(frame)) {
+        RequestStreamSubscriber subscriber =
+                new RequestStreamSubscriber(
+                        streamId,
+                        initialRequestN == Integer.MAX_VALUE ? Long.MAX_VALUE : initialRequestN,
+                        this.allocator,
+                        this.payloadDecoder,
+                        ReassemblyUtils.dataAndMetadata(frame),
+                        this.mtu,
+                        this.errorConsumer,
+                        this.sendingSubscriptions,
+                        this.sendProcessor,
+                        this);
+        if (activeStreams.putIfAbsent(streamId, subscriber) != null) {
+          subscriber.cancel();
+        }
+      } else {
+        RequestStreamSubscriber subscriber =
+                new RequestStreamSubscriber(
+                        streamId,
+                        initialRequestN == Integer.MAX_VALUE ? Long.MAX_VALUE : initialRequestN,
+                        this.allocator,
+                        this.mtu,
+                        this.errorConsumer,
+                        this.sendingSubscriptions,
+                        this.sendProcessor);
+        if (activeStreams.putIfAbsent(streamId, subscriber) == null) {
+          this.requestResponse(payloadDecoder.apply(frame)).subscribe(subscriber);
+        }
+      }
+    }
   }
 
   private void handleChannel(int streamId, Payload payload, int initialRequestN) {

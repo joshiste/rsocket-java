@@ -67,7 +67,7 @@ final class WebsocketSecureTransportTest implements TransportTest {
 
   @Override
   public Duration getTimeout() {
-    return Duration.ofMinutes(3);
+    return Duration.ofMinutes(5);
   }
 
   @Override

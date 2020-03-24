@@ -148,7 +148,8 @@ public class RSocketResponderTest {
           acceptingSocket,
           DefaultPayload::create,
           throwable -> errors.add(throwable),
-          ResponderLeaseHandler.None);
+          ResponderLeaseHandler.None,
+          0);
     }
 
     private void sendRequest(int streamId, FrameType frameType) {

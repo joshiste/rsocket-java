@@ -112,7 +112,8 @@ class RSocketLeaseTest {
             mockRSocketHandler,
             payloadDecoder,
             err -> {},
-            responderLeaseHandler);
+            responderLeaseHandler,
+            0);
   }
 
   @Test
