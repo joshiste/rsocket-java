@@ -2,6 +2,7 @@ package io.rsocket;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ReferenceCountUtil;
@@ -12,6 +13,7 @@ import io.rsocket.frame.FrameLengthFlyweight;
 import io.rsocket.frame.FrameType;
 import io.rsocket.frame.RequestNFrameFlyweight;
 import io.rsocket.frame.RequestStreamFrameFlyweight;
+import io.rsocket.frame.decoder.PayloadDecoder;
 import io.rsocket.internal.UnboundedProcessor;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import org.reactivestreams.Subscription;
@@ -24,16 +26,16 @@ import reactor.util.annotation.NonNull;
 import reactor.util.annotation.Nullable;
 import reactor.util.context.Context;
 
-final class RequestStreamFlux extends Flux<Payload>
-    implements CoreSubscriber<Payload>, Subscription, Scannable {
+final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payload>, Scannable {
 
   final ByteBufAllocator allocator;
   final Payload payload;
   final int mtu;
   final StateAware parent;
   final StreamIdSupplier streamIdSupplier;
-  final IntObjectMap<CoreSubscriber<? super Payload>> activeSubscribers;
+  final IntObjectMap<Reassemble<?>> activeSubscribers;
   final UnboundedProcessor<ByteBuf> sendProcessor;
+  final PayloadDecoder payloadDecoder;
 
   static final long STATE_UNSUBSCRIBED = -2;
   static final long STATE_SUBSCRIBED = -1;
@@ -46,6 +48,7 @@ final class RequestStreamFlux extends Flux<Payload>
 
   int streamId;
   CoreSubscriber<? super Payload> actual;
+  CompositeByteBuf frames;
 
   RequestStreamFlux(
       ByteBufAllocator allocator,
@@ -53,8 +56,9 @@ final class RequestStreamFlux extends Flux<Payload>
       int mtu,
       StateAware parent,
       StreamIdSupplier streamIdSupplier,
-      IntObjectMap<CoreSubscriber<? super Payload>> activeSubscribers,
-      UnboundedProcessor<ByteBuf> sendProcessor) {
+      IntObjectMap<Reassemble<?>> activeSubscribers,
+      UnboundedProcessor<ByteBuf> sendProcessor,
+      PayloadDecoder payloadDecoder) {
     this.allocator = allocator;
     this.payload = payload;
     this.mtu = mtu;
@@ -62,6 +66,7 @@ final class RequestStreamFlux extends Flux<Payload>
     this.streamIdSupplier = streamIdSupplier;
     this.activeSubscribers = activeSubscribers;
     this.sendProcessor = sendProcessor;
+    this.payloadDecoder = payloadDecoder;
 
     REQUESTED.lazySet(this, STATE_UNSUBSCRIBED);
   }
@@ -102,6 +107,12 @@ final class RequestStreamFlux extends Flux<Payload>
         || REQUESTED.getAndSet(this, STATE_TERMINATED) == STATE_TERMINATED) {
       Operators.onErrorDropped(cause, currentContext());
       return;
+    }
+
+    final CompositeByteBuf frames = this.frames;
+    this.frames = null;
+    if (frames != null && frames.refCnt() > 0) {
+      ReferenceCountUtil.safeRelease(frames);
     }
 
     this.activeSubscribers.remove(this.streamId, this);
@@ -200,7 +211,7 @@ final class RequestStreamFlux extends Flux<Payload>
           return;
         }
 
-        final IntObjectMap<CoreSubscriber<? super Payload>> as = this.activeSubscribers;
+        final IntObjectMap<Reassemble<?>> as = this.activeSubscribers;
         final Payload p = this.payload;
         final int mtu = this.mtu;
 
@@ -326,8 +337,51 @@ final class RequestStreamFlux extends Flux<Payload>
         final int streamId = this.streamId;
         final ByteBuf cancelFrame = CancelFrameFlyweight.encode(this.allocator, streamId);
 
+        final CompositeByteBuf frames = this.frames;
+        this.frames = null;
+        if (frames.refCnt() > 0) {
+          ReferenceCountUtil.safeRelease(frames);
+        }
+
         this.activeSubscribers.remove(streamId, this);
         this.sendProcessor.onNext(cancelFrame);
+      }
+    }
+  }
+
+  @Override
+  public boolean isReassemblingNow() {
+    return this.frames != null;
+  }
+
+  @Override
+  public void reassemble(ByteBuf dataAndMetadata, boolean hasFollows, boolean terminal) {
+    final CompositeByteBuf frames = this.frames;
+
+    if (frames == null) {
+      this.frames = this.allocator.compositeBuffer().addComponent(true, dataAndMetadata);
+      return;
+    } else {
+      frames.addComponent(true, dataAndMetadata);
+    }
+
+    if (!hasFollows) {
+      this.frames = null;
+      try {
+        this.onNext(this.payloadDecoder.apply(frames));
+        ReferenceCountUtil.safeRelease(frames);
+
+        if (terminal) {
+          this.onComplete();
+        }
+      } catch (Throwable t) {
+        ReferenceCountUtil.safeRelease(frames);
+        Exceptions.throwIfFatal(t);
+
+        if (this.requested != STATE_TERMINATED) {
+          this.actual.onError(t);
+        }
+        this.cancel();
       }
     }
   }

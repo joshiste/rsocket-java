@@ -2,6 +2,7 @@ package io.rsocket;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ReferenceCountUtil;
@@ -11,6 +12,7 @@ import io.rsocket.frame.CancelFrameFlyweight;
 import io.rsocket.frame.FrameLengthFlyweight;
 import io.rsocket.frame.FrameType;
 import io.rsocket.frame.RequestResponseFrameFlyweight;
+import io.rsocket.frame.decoder.PayloadDecoder;
 import io.rsocket.internal.UnboundedProcessor;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
@@ -24,16 +26,16 @@ import reactor.util.annotation.NonNull;
 import reactor.util.annotation.Nullable;
 import reactor.util.context.Context;
 
-final class RequestResponseMono extends Mono<Payload>
-    implements CoreSubscriber<Payload>, Subscription, Scannable {
+final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payload>, Scannable {
 
   final ByteBufAllocator allocator;
   final Payload payload;
   final int mtu;
   final StateAware parent;
   final StreamIdSupplier streamIdSupplier;
-  final IntObjectMap<CoreSubscriber<? super Payload>> activeSubscriber;
+  final IntObjectMap<Reassemble<?>> activeSubscriber;
   final UnboundedProcessor<ByteBuf> sendProcessor;
+  final PayloadDecoder payloadDecoder;
 
   static final int STATE_UNSUBSCRIBED = 0;
   static final int STATE_SUBSCRIBED = 1;
@@ -46,6 +48,7 @@ final class RequestResponseMono extends Mono<Payload>
 
   int streamId;
   CoreSubscriber<? super Payload> actual;
+  CompositeByteBuf frames;
 
   RequestResponseMono(
       ByteBufAllocator allocator,
@@ -53,8 +56,10 @@ final class RequestResponseMono extends Mono<Payload>
       int mtu,
       StateAware parent,
       StreamIdSupplier streamIdSupplier,
-      IntObjectMap<CoreSubscriber<? super Payload>> activeSubscribers,
-      UnboundedProcessor<ByteBuf> sendProcessor) {
+      IntObjectMap<Reassemble<?>> activeSubscribers,
+      UnboundedProcessor<ByteBuf> sendProcessor,
+      PayloadDecoder payloadDecoder) {
+
     this.allocator = allocator;
     this.payload = payload;
     this.mtu = mtu;
@@ -62,6 +67,7 @@ final class RequestResponseMono extends Mono<Payload>
     this.streamIdSupplier = streamIdSupplier;
     this.activeSubscriber = activeSubscribers;
     this.sendProcessor = sendProcessor;
+    this.payloadDecoder = payloadDecoder;
   }
 
   @Override
@@ -96,6 +102,12 @@ final class RequestResponseMono extends Mono<Payload>
       return;
     }
 
+    final CompositeByteBuf frames = this.frames;
+    this.frames = null;
+    if (frames != null && frames.refCnt() > 0) {
+      ReferenceCountUtil.safeRelease(frames);
+    }
+
     this.activeSubscriber.remove(this.streamId, this);
 
     this.actual.onError(cause);
@@ -103,7 +115,8 @@ final class RequestResponseMono extends Mono<Payload>
 
   @Override
   public final void onNext(@Nullable Payload value) {
-    if (state == STATE_TERMINATED || STATE.getAndSet(this, STATE_TERMINATED) == STATE_TERMINATED) {
+    if (this.state == STATE_TERMINATED
+        || STATE.getAndSet(this, STATE_TERMINATED) == STATE_TERMINATED) {
       ReferenceCountUtil.safeRelease(value);
       return;
     }
@@ -160,7 +173,7 @@ final class RequestResponseMono extends Mono<Payload>
         return;
       }
 
-      final IntObjectMap<CoreSubscriber<? super Payload>> as = this.activeSubscriber;
+      final IntObjectMap<Reassemble<?>> as = this.activeSubscriber;
       final Payload p = this.payload;
       final int mtu = this.mtu;
       final UnboundedProcessor<ByteBuf> sender = this.sendProcessor;
@@ -224,8 +237,43 @@ final class RequestResponseMono extends Mono<Payload>
       } else {
         final int streamId = this.streamId;
 
+        final CompositeByteBuf frames = this.frames;
+        this.frames = null;
+        if (frames.refCnt() > 0) {
+          ReferenceCountUtil.safeRelease(frames);
+        }
+
         this.activeSubscriber.remove(streamId, this);
         this.sendProcessor.onNext(CancelFrameFlyweight.encode(this.allocator, streamId));
+      }
+    }
+  }
+
+  @Override
+  public boolean isReassemblingNow() {
+    return this.frames != null;
+  }
+
+  @Override
+  public void reassemble(ByteBuf dataAndMetadata, boolean hasFollows, boolean terminal) {
+    final CompositeByteBuf frames = this.frames;
+
+    if (frames == null) {
+      this.frames = this.allocator.compositeBuffer().addComponent(true, dataAndMetadata);
+      return;
+    } else {
+      frames.addComponent(true, dataAndMetadata);
+    }
+
+    if (!hasFollows) {
+      this.frames = null;
+      try {
+        this.onNext(this.payloadDecoder.apply(frames));
+        ReferenceCountUtil.safeRelease(frames);
+      } catch (Throwable t) {
+        ReferenceCountUtil.safeRelease(frames);
+        Exceptions.throwIfFatal(t);
+        this.onError(t);
       }
     }
   }

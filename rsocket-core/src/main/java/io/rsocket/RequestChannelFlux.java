@@ -2,6 +2,7 @@ package io.rsocket;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ReferenceCountUtil;
@@ -14,6 +15,7 @@ import io.rsocket.frame.FrameType;
 import io.rsocket.frame.PayloadFrameFlyweight;
 import io.rsocket.frame.RequestChannelFrameFlyweight;
 import io.rsocket.frame.RequestNFrameFlyweight;
+import io.rsocket.frame.decoder.PayloadDecoder;
 import io.rsocket.internal.UnboundedProcessor;
 import java.util.Objects;
 import java.util.concurrent.CancellationException;
@@ -36,9 +38,10 @@ final class RequestChannelFlux extends Flux<Payload>
   final Flux<Payload> payloadPublisher;
   final StateAware parent;
   final StreamIdSupplier streamIdSupplier;
-  final IntObjectMap<CoreSubscriber<? super Payload>> activeStreams;
+  final IntObjectMap<Reassemble<?>> activeStreams;
   final IntObjectMap<Subscription> activeSubscriptions;
   final UnboundedProcessor<ByteBuf> sendProcessor;
+  final PayloadDecoder payloadDecoder;
 
   static final long STATE_UNSUBSCRIBED = -2;
   static final long STATE_SUBSCRIBED = -1;
@@ -60,9 +63,10 @@ final class RequestChannelFlux extends Flux<Payload>
       int mtu,
       StateAware parent,
       StreamIdSupplier streamIdSupplier,
-      IntObjectMap<CoreSubscriber<? super Payload>> activeSubscribers,
+      IntObjectMap<Reassemble<?>> activeSubscribers,
       IntObjectMap<Subscription> activeSubscriptions,
-      UnboundedProcessor<ByteBuf> sendProcessor) {
+      UnboundedProcessor<ByteBuf> sendProcessor,
+      PayloadDecoder payloadDecoder) {
     this.allocator = allocator;
     this.payloadPublisher = payloadPublisher;
     this.mtu = mtu;
@@ -71,6 +75,7 @@ final class RequestChannelFlux extends Flux<Payload>
     this.activeStreams = activeSubscribers;
     this.activeSubscriptions = activeSubscriptions;
     this.sendProcessor = sendProcessor;
+    this.payloadDecoder = payloadDecoder;
 
     REQUESTED.lazySet(this, STATE_UNSUBSCRIBED);
   }
@@ -100,7 +105,7 @@ final class RequestChannelFlux extends Flux<Payload>
     }
     final UnboundedProcessor<ByteBuf> sender = this.sendProcessor;
     final ByteBufAllocator allocator = this.allocator;
-    final IntObjectMap<CoreSubscriber<? super Payload>> as = this.activeStreams;
+    final IntObjectMap<Reassemble<?>> as = this.activeStreams;
     final IntObjectMap<Subscription> ass = this.activeSubscriptions;
     final int mtu = this.mtu;
 
@@ -359,7 +364,8 @@ final class RequestChannelFlux extends Flux<Payload>
     if (this.requested == STATE_UNSUBSCRIBED
         && REQUESTED.compareAndSet(this, STATE_UNSUBSCRIBED, STATE_SUBSCRIBED)) {
       this.connector =
-          new InnerConnectorSubscriber(this, actual, activeStreams, activeSubscriptions);
+          new InnerConnectorSubscriber(
+              this, actual, activeStreams, activeSubscriptions, payloadDecoder, allocator);
       this.payloadPublisher.subscribe(this);
     } else {
       Operators.error(
@@ -421,6 +427,12 @@ final class RequestChannelFlux extends Flux<Payload>
         return;
       }
 
+      final CompositeByteBuf frames = connector.frames;
+      connector.frames = null;
+      if (frames.refCnt() > 0) {
+        ReferenceCountUtil.safeRelease(frames);
+      }
+
       final int streamId = this.streamId;
       this.activeStreams.remove(streamId, connector);
 
@@ -454,24 +466,31 @@ final class RequestChannelFlux extends Flux<Payload>
   // this should be stored to listen for requestN frames from the Responder side
   // this should accommodate frame sending logic, since it receives frames from the requester side
   // and should deliver them to the responder one
-  static final class InnerConnectorSubscriber implements CoreSubscriber<Payload>, Subscription {
+  static final class InnerConnectorSubscriber implements Reassemble<Payload> {
 
     final RequestChannelFlux parent;
     final CoreSubscriber<? super Payload> actual;
-    final IntObjectMap<CoreSubscriber<? super Payload>> activeStreams;
+    final IntObjectMap<Reassemble<?>> activeStreams;
     final IntObjectMap<Subscription> activeSubscriptions;
+    final PayloadDecoder payloadDecoder;
+    final ByteBufAllocator allocator;
 
     Subscription s;
+    CompositeByteBuf frames;
 
     InnerConnectorSubscriber(
         RequestChannelFlux parent,
         CoreSubscriber<? super Payload> actual,
-        IntObjectMap<CoreSubscriber<? super Payload>> activeStreams,
-        IntObjectMap<Subscription> activeSubscriptions) {
+        IntObjectMap<Reassemble<?>> activeStreams,
+        IntObjectMap<Subscription> activeSubscriptions,
+        PayloadDecoder payloadDecoder,
+        ByteBufAllocator allocator) {
       this.parent = parent;
       this.actual = actual;
       this.activeStreams = activeStreams;
       this.activeSubscriptions = activeSubscriptions;
+      this.payloadDecoder = payloadDecoder;
+      this.allocator = allocator;
     }
 
     @Override
@@ -502,6 +521,12 @@ final class RequestChannelFlux extends Flux<Payload>
         return;
       }
 
+      final CompositeByteBuf frames = this.frames;
+      this.frames = null;
+      if (frames.refCnt() > 0) {
+        ReferenceCountUtil.safeRelease(frames);
+      }
+
       final int streamId = this.parent.streamId;
 
       this.activeSubscriptions.remove(streamId, this);
@@ -530,6 +555,44 @@ final class RequestChannelFlux extends Flux<Payload>
     public void cancel() {
       this.activeSubscriptions.remove(this.parent.streamId, this);
       this.s.cancel();
+    }
+
+    @Override
+    public boolean isReassemblingNow() {
+      return this.frames != null;
+    }
+
+    @Override
+    public void reassemble(ByteBuf dataAndMetadata, boolean hasFollows, boolean terminal) {
+      final CompositeByteBuf frames = this.frames;
+
+      if (frames == null) {
+        this.frames = this.allocator.compositeBuffer().addComponent(true, dataAndMetadata);
+        return;
+      } else {
+        frames.addComponent(true, dataAndMetadata);
+      }
+
+      if (!hasFollows) {
+        this.frames = null;
+        try {
+          this.onNext(this.payloadDecoder.apply(frames));
+          ReferenceCountUtil.safeRelease(frames);
+
+          if (terminal) {
+            this.onComplete();
+          }
+        } catch (Throwable t) {
+          ReferenceCountUtil.safeRelease(frames);
+          Exceptions.throwIfFatal(t);
+
+          RequestChannelFlux parent = this.parent;
+          if (!parent.isTerminated()) {
+            this.actual.onError(t);
+          }
+          parent.cancel();
+        }
+      }
     }
   }
 }

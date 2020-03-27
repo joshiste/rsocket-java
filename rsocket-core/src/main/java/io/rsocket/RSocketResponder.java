@@ -18,24 +18,28 @@ package io.rsocket;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.Unpooled;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
-import io.rsocket.exceptions.ApplicationErrorException;
 import io.rsocket.fragmentation.ReassemblyUtils;
-import io.rsocket.frame.*;
+import io.rsocket.frame.ErrorFrameFlyweight;
+import io.rsocket.frame.FrameHeaderFlyweight;
+import io.rsocket.frame.FrameType;
+import io.rsocket.frame.RequestChannelFrameFlyweight;
+import io.rsocket.frame.RequestNFrameFlyweight;
+import io.rsocket.frame.RequestStreamFrameFlyweight;
 import io.rsocket.frame.decoder.PayloadDecoder;
-import io.rsocket.internal.RateLimitableRequestPublisher;
 import io.rsocket.internal.SynchronizedIntObjectHashMap;
 import io.rsocket.internal.UnboundedProcessor;
 import io.rsocket.lease.ResponderLeaseHandler;
 import java.util.function.Consumer;
-import org.reactivestreams.Processor;
 import org.reactivestreams.Publisher;
-import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 import reactor.core.Disposable;
 import reactor.core.Exceptions;
-import reactor.core.publisher.*;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.publisher.SignalType;
 
 /** Responder side of RSocket. Receives {@link ByteBuf}s from a peer's {@link RSocketRequester} */
 class RSocketResponder implements ResponderRSocket {
@@ -47,9 +51,7 @@ class RSocketResponder implements ResponderRSocket {
   private final Consumer<Throwable> errorConsumer;
   private final ResponderLeaseHandler leaseHandler;
 
-  private final IntObjectMap<RateLimitableRequestPublisher> sendingLimitableSubscriptions;
-  private final IntObjectMap<Subscription> sendingSubscriptions;
-  private final IntObjectMap<Processor<Payload, Payload>> channelProcessors;
+  private final IntObjectMap<Reassemble<?>> activeStreams;
 
   private final UnboundedProcessor<ByteBuf> sendProcessor;
   private final ByteBufAllocator allocator;
@@ -75,9 +77,7 @@ class RSocketResponder implements ResponderRSocket {
     this.payloadDecoder = payloadDecoder;
     this.errorConsumer = errorConsumer;
     this.leaseHandler = leaseHandler;
-    this.sendingLimitableSubscriptions = new SynchronizedIntObjectHashMap<>();
-    this.sendingSubscriptions = new SynchronizedIntObjectHashMap<>();
-    this.channelProcessors = new SynchronizedIntObjectHashMap<>();
+    this.activeStreams = new SynchronizedIntObjectHashMap<>();
 
     // DO NOT Change the order here. The Send processor must be subscribed to before receiving
     // connections
@@ -105,38 +105,9 @@ class RSocketResponder implements ResponderRSocket {
   }
 
   private void handleSendProcessorError(Throwable t) {
-    sendingSubscriptions
-        .values()
-        .forEach(
-            subscription -> {
-              try {
-                subscription.cancel();
-              } catch (Throwable e) {
-                errorConsumer.accept(e);
-              }
-            });
-
-    sendingLimitableSubscriptions
-        .values()
-        .forEach(
-            subscription -> {
-              try {
-                subscription.cancel();
-              } catch (Throwable e) {
-                errorConsumer.accept(e);
-              }
-            });
-
-    channelProcessors
-        .values()
-        .forEach(
-            subscription -> {
-              try {
-                subscription.onError(t);
-              } catch (Throwable e) {
-                errorConsumer.accept(e);
-              }
-            });
+    for (Reassemble<?> reassemble : activeStreams.values()) {
+      reassemble.onError(t);
+    }
   }
 
   private void handleSendProcessorCancel(SignalType t) {
@@ -144,38 +115,9 @@ class RSocketResponder implements ResponderRSocket {
       return;
     }
 
-    sendingSubscriptions
-        .values()
-        .forEach(
-            subscription -> {
-              try {
-                subscription.cancel();
-              } catch (Throwable e) {
-                errorConsumer.accept(e);
-              }
-            });
-
-    sendingLimitableSubscriptions
-        .values()
-        .forEach(
-            subscription -> {
-              try {
-                subscription.cancel();
-              } catch (Throwable e) {
-                errorConsumer.accept(e);
-              }
-            });
-
-    channelProcessors
-        .values()
-        .forEach(
-            subscription -> {
-              try {
-                subscription.onComplete();
-              } catch (Throwable e) {
-                errorConsumer.accept(e);
-              }
-            });
+    for (Reassemble<?> reassemble : activeStreams.values()) {
+      reassemble.cancel();
+    }
   }
 
   @Override
@@ -273,29 +215,21 @@ class RSocketResponder implements ResponderRSocket {
 
   private void cleanup() {
     cleanUpSendingSubscriptions();
-    cleanUpChannelProcessors();
 
     requestHandler.dispose();
     sendProcessor.dispose();
   }
 
   private synchronized void cleanUpSendingSubscriptions() {
-    sendingSubscriptions.values().forEach(Subscription::cancel);
-    sendingSubscriptions.clear();
-
-    sendingLimitableSubscriptions.values().forEach(Subscription::cancel);
-    sendingLimitableSubscriptions.clear();
+    activeStreams.values().forEach(Subscription::cancel);
+    activeStreams.clear();
   }
 
-  private synchronized void cleanUpChannelProcessors() {
-    channelProcessors.values().forEach(Processor::onComplete);
-    channelProcessors.clear();
-  }
-
+  @SuppressWarnings({"rawtypes", "unchecked"})
   private void handleFrame(ByteBuf frame) {
     try {
       int streamId = FrameHeaderFlyweight.streamId(frame);
-      Subscriber<Payload> receiver;
+      Reassemble receiver;
       FrameType frameType = FrameHeaderFlyweight.frameType(frame);
       switch (frameType) {
         case REQUEST_FNF:
@@ -316,8 +250,7 @@ class RSocketResponder implements ResponderRSocket {
           break;
         case REQUEST_CHANNEL:
           int channelInitialRequestN = RequestChannelFrameFlyweight.initialRequestN(frame);
-          Payload channelPayload = payloadDecoder.apply(frame);
-          handleChannel(streamId, channelPayload, channelInitialRequestN);
+          handleChannel(streamId, frame, channelInitialRequestN);
           break;
         case METADATA_PUSH:
           handleMetadataPush(metadataPush(payloadDecoder.apply(frame)));
@@ -326,28 +259,43 @@ class RSocketResponder implements ResponderRSocket {
           // TODO: Hook in receiving socket.
           break;
         case NEXT:
-          receiver = channelProcessors.get(streamId);
+          receiver = activeStreams.get(streamId);
           if (receiver != null) {
-            receiver.onNext(payloadDecoder.apply(frame));
+            if (receiver.isReassemblingNow()) {
+              receiver.reassemble(
+                  ReassemblyUtils.dataAndMetadata(frame),
+                  FrameHeaderFlyweight.hasFollows(frame),
+                  false);
+            } else {
+              receiver.onNext(payloadDecoder.apply(frame));
+            }
           }
           break;
         case COMPLETE:
-          receiver = channelProcessors.get(streamId);
+          receiver = activeStreams.get(streamId);
           if (receiver != null) {
-            receiver.onComplete();
+            if (receiver.isReassemblingNow()) {
+              receiver.reassemble(Unpooled.EMPTY_BUFFER, false, true);
+            } else {
+              receiver.onComplete();
+            }
           }
           break;
         case ERROR:
-          receiver = channelProcessors.get(streamId);
+          receiver = activeStreams.get(streamId);
           if (receiver != null) {
-            receiver.onError(new ApplicationErrorException(ErrorFrameFlyweight.dataUtf8(frame)));
+            receiver.onError(io.rsocket.exceptions.Exceptions.from(streamId, frame));
           }
           break;
         case NEXT_COMPLETE:
-          receiver = channelProcessors.get(streamId);
+          receiver = activeStreams.get(streamId);
           if (receiver != null) {
-            receiver.onNext(payloadDecoder.apply(frame));
-            receiver.onComplete();
+            if (receiver.isReassemblingNow()) {
+              receiver.reassemble(ReassemblyUtils.dataAndMetadata(frame), false, true);
+            } else {
+              receiver.onNext(payloadDecoder.apply(frame));
+              receiver.onComplete();
+            }
           }
           break;
         case SETUP:
@@ -368,7 +316,7 @@ class RSocketResponder implements ResponderRSocket {
   }
 
   private void handleFireAndForget(int streamId, ByteBuf frame) {
-    final IntObjectMap<Subscription> activeStreams = this.sendingSubscriptions;
+    final IntObjectMap<Reassemble<?>> activeStreams = this.activeStreams;
     if (activeStreams.containsKey(streamId)) {
       if (FrameHeaderFlyweight.hasFollows(frame)) {
         FireAndForgetSubscriber subscriber =
@@ -390,7 +338,7 @@ class RSocketResponder implements ResponderRSocket {
   }
 
   private void handleRequestResponse(int streamId, ByteBuf frame) {
-    final IntObjectMap<Subscription> activeStreams = this.sendingSubscriptions;
+    final IntObjectMap<Reassemble<?>> activeStreams = this.activeStreams;
     if (activeStreams.containsKey(streamId)) {
       if (FrameHeaderFlyweight.hasFollows(frame)) {
         RequestResponseSubscriber subscriber =
@@ -401,7 +349,7 @@ class RSocketResponder implements ResponderRSocket {
                 ReassemblyUtils.dataAndMetadata(frame),
                 this.mtu,
                 this.errorConsumer,
-                this.sendingSubscriptions,
+                this.activeStreams,
                 this.sendProcessor,
                 this);
         if (activeStreams.putIfAbsent(streamId, subscriber) != null) {
@@ -414,7 +362,7 @@ class RSocketResponder implements ResponderRSocket {
                 this.allocator,
                 this.mtu,
                 this.errorConsumer,
-                this.sendingSubscriptions,
+                this.activeStreams,
                 this.sendProcessor);
         if (activeStreams.putIfAbsent(streamId, subscriber) == null) {
           this.requestResponse(payloadDecoder.apply(frame)).subscribe(subscriber);
@@ -424,7 +372,7 @@ class RSocketResponder implements ResponderRSocket {
   }
 
   private void handleStream(int streamId, ByteBuf frame, int initialRequestN) {
-    final IntObjectMap<Subscription> activeStreams = this.sendingSubscriptions;
+    final IntObjectMap<Reassemble<?>> activeStreams = this.activeStreams;
     if (activeStreams.containsKey(streamId)) {
       if (FrameHeaderFlyweight.hasFollows(frame)) {
         RequestStreamSubscriber subscriber =
@@ -436,7 +384,7 @@ class RSocketResponder implements ResponderRSocket {
                 ReassemblyUtils.dataAndMetadata(frame),
                 this.mtu,
                 this.errorConsumer,
-                this.sendingSubscriptions,
+                this.activeStreams,
                 this.sendProcessor,
                 this);
         if (activeStreams.putIfAbsent(streamId, subscriber) != null) {
@@ -450,61 +398,62 @@ class RSocketResponder implements ResponderRSocket {
                 this.allocator,
                 this.mtu,
                 this.errorConsumer,
-                this.sendingSubscriptions,
+                this.activeStreams,
                 this.sendProcessor);
         if (activeStreams.putIfAbsent(streamId, subscriber) == null) {
-          this.requestResponse(payloadDecoder.apply(frame)).subscribe(subscriber);
+          this.requestStream(payloadDecoder.apply(frame)).subscribe(subscriber);
         }
       }
     }
   }
 
-  private void handleChannel(int streamId, Payload payload, int initialRequestN) {
-    UnicastProcessor<Payload> frames = UnicastProcessor.create();
-    channelProcessors.put(streamId, frames);
-
-    Flux<Payload> payloads =
-        frames
-            .doOnCancel(
-                () -> sendProcessor.onNext(CancelFrameFlyweight.encode(allocator, streamId)))
-            .doOnError(t -> handleError(streamId, t))
-            .doOnRequest(
-                l -> sendProcessor.onNext(RequestNFrameFlyweight.encode(allocator, streamId, l)))
-            .doFinally(signalType -> channelProcessors.remove(streamId));
-
-    // not chained, as the payload should be enqueued in the Unicast processor before this method
-    // returns
-    // and any later payload can be processed
-    frames.onNext(payload);
-
-    if (responderRSocket != null) {
-      handleStream(streamId, requestChannel(payload, payloads), initialRequestN);
-    } else {
-      handleStream(streamId, requestChannel(payloads), initialRequestN);
+  private void handleChannel(int streamId, ByteBuf frame, int initialRequestN) {
+    final IntObjectMap<Reassemble<?>> activeStreams = this.activeStreams;
+    if (activeStreams.containsKey(streamId)) {
+      if (FrameHeaderFlyweight.hasFollows(frame)) {
+        RequestChannelSubscriber subscriber =
+            new RequestChannelSubscriber(
+                streamId,
+                initialRequestN == Integer.MAX_VALUE ? Long.MAX_VALUE : initialRequestN,
+                this.allocator,
+                this.payloadDecoder,
+                ReassemblyUtils.dataAndMetadata(frame),
+                this.mtu,
+                this.errorConsumer,
+                this.activeStreams,
+                this.sendProcessor,
+                this);
+        if (activeStreams.putIfAbsent(streamId, subscriber) != null) {
+          subscriber.cancel();
+        }
+      } else {
+        final Payload firstPayload = this.payloadDecoder.apply(frame);
+        RequestChannelSubscriber subscriber =
+            new RequestChannelSubscriber(
+                streamId,
+                initialRequestN == Integer.MAX_VALUE ? Long.MAX_VALUE : initialRequestN,
+                this.allocator,
+                this.payloadDecoder,
+                firstPayload,
+                this.mtu,
+                this.errorConsumer,
+                this.activeStreams,
+                this.sendProcessor);
+        if (activeStreams.putIfAbsent(streamId, subscriber) == null) {
+          this.requestChannel(firstPayload, subscriber).subscribe(subscriber.senderSubscriber);
+        } else {
+          firstPayload.release();
+        }
+      }
     }
   }
 
   private void handleMetadataPush(Mono<Void> result) {
-    result.subscribe(
-        new BaseSubscriber<Void>() {
-          @Override
-          protected void hookOnSubscribe(Subscription subscription) {
-            subscription.request(Long.MAX_VALUE);
-          }
-
-          @Override
-          protected void hookOnError(Throwable throwable) {
-            errorConsumer.accept(throwable);
-          }
-        });
+    result.subscribe(this.noOpFireAndForgetSubscriber);
   }
 
   private void handleCancelFrame(int streamId) {
-    Subscription subscription = sendingSubscriptions.remove(streamId);
-
-    if (subscription == null) {
-      subscription = sendingLimitableSubscriptions.remove(streamId);
-    }
+    Subscription subscription = activeStreams.remove(streamId);
 
     if (subscription != null) {
       subscription.cancel();
@@ -517,11 +466,7 @@ class RSocketResponder implements ResponderRSocket {
   }
 
   private void handleRequestN(int streamId, ByteBuf frame) {
-    Subscription subscription = sendingSubscriptions.get(streamId);
-
-    if (subscription == null) {
-      subscription = sendingLimitableSubscriptions.get(streamId);
-    }
+    Subscription subscription = activeStreams.get(streamId);
 
     if (subscription != null) {
       int n = RequestNFrameFlyweight.requestN(frame);

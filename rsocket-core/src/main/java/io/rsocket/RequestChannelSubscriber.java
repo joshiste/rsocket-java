@@ -8,14 +8,15 @@ import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.fragmentation.FragmentationUtils;
+import io.rsocket.frame.CancelFrameFlyweight;
 import io.rsocket.frame.ErrorFrameFlyweight;
 import io.rsocket.frame.FrameLengthFlyweight;
 import io.rsocket.frame.FrameType;
 import io.rsocket.frame.PayloadFrameFlyweight;
+import io.rsocket.frame.RequestNFrameFlyweight;
 import io.rsocket.frame.decoder.PayloadDecoder;
 import io.rsocket.internal.UnboundedProcessor;
 import java.util.concurrent.CancellationException;
-import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.function.Consumer;
 import org.reactivestreams.Subscription;
@@ -25,51 +26,51 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Operators;
 import reactor.util.context.Context;
 
-public class RequestChannelSubscriber extends Flux<Payload>
-    implements CoreSubscriber<Payload>, Reassemble {
+public class RequestChannelSubscriber extends Flux<Payload> implements Reassemble<Payload> {
 
   final int streamId;
   final ByteBufAllocator allocator;
   final Consumer<? super Throwable> errorConsumer;
   final PayloadDecoder payloadDecoder;
   final int mtu;
-  final IntObjectMap<? super Subscription> activeStreams;
+  final IntObjectMap<Reassemble<?>> activeStreams;
   final UnboundedProcessor<ByteBuf> sendProcessor;
 
   final ResponderRSocket handler;
 
-  volatile int wip;
-  static final AtomicIntegerFieldUpdater<RequestChannelSubscriber> WIP =
-      AtomicIntegerFieldUpdater.newUpdater(RequestChannelSubscriber.class, "wip");
-
   volatile long requested;
   static final AtomicLongFieldUpdater<RequestChannelSubscriber> REQUESTED =
       AtomicLongFieldUpdater.newUpdater(RequestChannelSubscriber.class, "requested");
-  // |.....INITIAL STATE.....|...RESULT STATE.....|    |..INITIAL BITS...|.RESULT BITS..|
-  // | ANY                 ->| TERMINATED         |    | _XX_XXXX...X  ->| _10_0000...0 |
-  // | UNSUB + UNREQ       ->| SUB   + UNREQ      |    | _00_XXXX...X  ->| _01_XXXX...X |
-  // | UNSUB + REQ         ->| SUB   + REQ        |    | _00_0000...0  ->| _01_0000...0 |
-  // | UNSUB + UNREQ       ->| UNSUB + REQ        |    | _00_XXXX...X  ->| _00_0000...0 |
+  // |.....INITIAL STATE.....|...RESULT STATE.....|    |...INITIAL BITS...|..RESULT BITS..|
+  // | UNSUB + UNREQ       ->| SUB   + UNREQ      |    | _000_XXXX...X  ->| _001_XXXX...X |
+  // | UNSUB + REQ         ->| SUB   + REQ        |    | _000_0000...0  ->| _001_0000...0 |
+  // | UNSUB + UNREQ       ->| UNSUB + REQ        |    | _000_XXXX...X  ->| _000_0000...0 |
   //  BY THIS POINT FIRST REQUEST TO UPSTREAM IS ALWAYS 0
-  // | SUB   + UNREQ + NF  ->| SUB   + REQ   + NF |    | _01_XXXX...X  ->| _01_0000...0 |
-  // | SUB   + UNREQ + NF  ->| SUB   + UNREQ + F  |    | _01_XXXX...X  ->| _11_XXXX...X |
-  // | SUB   + UNREQ + F   ->| SUB   + REQ   + F  |    | _11_XXXX...X  ->| _11_0000...0 |
-  // | SUB   + REQ   + NF  ->| SUB   + REQ   + F  |    | _01_0000...0  ->| _11_0000...0 |
+  // | SUB   + UNREQ + NF  ->| SUB   + REQ   + NF |    | _001_XXXX...X  ->| _001_0000...0 |
+  // | SUB   + UNREQ + NF  ->| SUB   + UNREQ + F  |    | _001_XXXX...X  ->| _011_XXXX...X |
+  // | SUB   + UNREQ + F   ->| SUB   + REQ   + F  |    | _011_XXXX...X  ->| _011_0000...0 |
+  // | SUB   + REQ   + NF  ->| SUB   + REQ   + F  |    | _001_0000...0  ->| _011_0000...0 |
+  //  TERMINAL STATES
+  // | ANY                 ->| TERMINATED         |    | _XXX_XXXX...X  ->| _100_0000...0 |
+  // | ANY                 ->| HALF_CLOSED        |    | _XXX_XXXX...X  ->| _1XX_XXXX...X |
   //
   //
-  //                                          2_BITS_STATE⌍                          ⌌ 62_BITS_REQUEST_VALUE
-  //                                                     |..|..62...|      |..|..62...|
-  //                                                     |....64....|      |....64....|
+  //                                          3_BITS_STATE⌍                          ⌌
+  // 61_BITS_REQUEST_VALUE
+  //                                                     |.3.|...61...|     |.3.|...61...|
+  //                                                     |.....64.....|     |.....64.....|
   //                                                     3  bits for STATE
   //                                                     61 bits for REQUESTED
-  static final long REQUEST_MAX_VALUE =
-      Long.MAX_VALUE / 2; // can do that since max requestN is Integer.MAX_VALUE
+
+  // can do that since max requestN is Integer.MAX_VALUE so having 61 bits is more than enough
+  static final long REQUEST_MAX_VALUE = Long.MAX_VALUE / 4;
 
   static final long FLAG_UNSUBSCRIBED = 0;
-  static final long FLAG_SUBSCRIBED = Long.MAX_VALUE / 2 + 1;
-  static final long FLAG_FIRST = Long.MIN_VALUE;
+  static final long FLAG_SUBSCRIBED = Long.MAX_VALUE / 4 + 1;
+  static final long FLAG_FIRST = Long.MAX_VALUE / 2 + 1;
+  static final long FLAG_HALF_CLOSED = Long.MIN_VALUE;
 
-  static final long MASK_FLAGS = FLAG_SUBSCRIBED | FLAG_FIRST;
+  static final long MASK_FLAGS = FLAG_SUBSCRIBED | FLAG_FIRST | FLAG_HALF_CLOSED;
   static final long MASK_REQUESTED = ~MASK_FLAGS;
 
   static final long STATE_REQUESTED = 0;
@@ -90,7 +91,7 @@ public class RequestChannelSubscriber extends Flux<Payload>
       ByteBuf firstFrame,
       int mtu,
       Consumer<? super Throwable> errorConsumer,
-      IntObjectMap<? super Subscription> activeStreams,
+      IntObjectMap<Reassemble<?>> activeStreams,
       UnboundedProcessor<ByteBuf> sendProcessor,
       ResponderRSocket handler) {
     this.streamId = streamId;
@@ -112,10 +113,9 @@ public class RequestChannelSubscriber extends Flux<Payload>
       ByteBufAllocator allocator,
       PayloadDecoder payloadDecoder,
       Payload firstPayload,
-      Flux<Payload> payloads,
       int mtu,
       Consumer<? super Throwable> errorConsumer,
-      IntObjectMap<? super Subscription> activeStreams,
+      IntObjectMap<Reassemble<?>> activeStreams,
       UnboundedProcessor<ByteBuf> sendProcessor) {
     this.streamId = streamId;
     this.allocator = allocator;
@@ -125,14 +125,20 @@ public class RequestChannelSubscriber extends Flux<Payload>
     this.sendProcessor = sendProcessor;
     this.payloadDecoder = payloadDecoder;
 
-    final OuterSenderSubscriber senderSubscriber = new OuterSenderSubscriber(this);
-    this.senderSubscriber = senderSubscriber;
+    this.senderSubscriber =
+        new OuterSenderSubscriber(
+            this,
+            firstPayload,
+            payloadDecoder,
+            mtu,
+            sendProcessor,
+            activeStreams,
+            allocator,
+            errorConsumer);
     this.handler = null;
     this.frames = null;
 
     REQUESTED.lazySet(this, firstRequest);
-
-    payloads.subscribe(senderSubscriber);
   }
 
   @Override
@@ -168,6 +174,16 @@ public class RequestChannelSubscriber extends Flux<Payload>
   }
 
   @Override
+  public Context currentContext() {
+
+    if ((this.requested & FLAG_SUBSCRIBED) != FLAG_UNSUBSCRIBED) {
+      return Context.empty();
+    }
+
+    return this.actual.currentContext();
+  }
+
+  @Override
   // subscription from the requestChannel method
   public void onSubscribe(Subscription subscription) {
     long state;
@@ -181,7 +197,7 @@ public class RequestChannelSubscriber extends Flux<Payload>
       }
 
       this.s = subscription;
-      if (REQUESTED.compareAndSet(this, state, (state & MASK_FLAGS))) {
+      if (REQUESTED.compareAndSet(this, state, (state & MASK_FLAGS) | MASK_REQUESTED)) {
         subscription.request(requested == REQUEST_MAX_VALUE ? Long.MAX_VALUE : requested);
         return;
       }
@@ -225,6 +241,7 @@ public class RequestChannelSubscriber extends Flux<Payload>
     this.activeStreams.remove(this.streamId, this);
 
     final CompositeByteBuf frames = this.frames;
+    this.frames = null;
     if (frames != null && frames.refCnt() > 0) {
       ReferenceCountUtil.safeRelease(frames);
     }
@@ -249,13 +266,14 @@ public class RequestChannelSubscriber extends Flux<Payload>
       return;
     }
 
+    this.frames = this.allocator.compositeBuffer();
     this.actual.onNext(p);
   }
 
   @Override
   public void onError(Throwable t) {
     if (this.done) {
-      Operators.onErrorDropped(t, Context.empty());
+      Operators.onErrorDropped(t, currentContext());
       return;
     }
 
@@ -264,19 +282,25 @@ public class RequestChannelSubscriber extends Flux<Payload>
 
     long state = REQUESTED.getAndSet(this, STATE_TERMINATED);
     if (state == STATE_TERMINATED) {
-      Operators.onErrorDropped(t, Context.empty());
+      Operators.onErrorDropped(t, currentContext());
       return;
     }
 
-    this.activeStreams.remove(this.streamId, this);
+    final CompositeByteBuf frames = this.frames;
+    this.frames = null;
+    if (frames != null && frames.refCnt() > 0) {
+      ReferenceCountUtil.safeRelease(frames);
+    }
 
-    if ((state & MASK_FLAGS) != FLAG_UNSUBSCRIBED)  {
+    if ((state & MASK_FLAGS) != FLAG_UNSUBSCRIBED) {
       this.actual.onError(t);
     }
 
     if ((state & FLAG_FIRST) != FLAG_FIRST) {
       ReferenceCountUtil.safeRelease(this.senderSubscriber.firstPayload);
     }
+
+    this.activeStreams.remove(this.streamId, this);
 
     this.s.cancel();
   }
@@ -290,55 +314,20 @@ public class RequestChannelSubscriber extends Flux<Payload>
     this.done = true;
 
     long state;
-    for (;;) {
+    for (; ; ) {
       state = this.requested;
 
       if (state == STATE_TERMINATED) {
         return;
       }
 
-      if ((state & FLAG_FIRST) == FLAG_FIRST) {
-        this.actual.onComplete();
-        this.tryTerminate();
-        return;
-      }
-
-      if (REQUESTED.compareAndSet(this, state, state | FLAG_FIRST)) {
-        return;
+      if (REQUESTED.compareAndSet(this, state, state | FLAG_HALF_CLOSED)) {
+        break;
       }
     }
-  }
 
-  void tryTerminate() {
-    if (this.requested == STATE_TERMINATED) {
-      return;
-    }
-
-    if (WIP.getAndIncrement(this) != 0) {
-      return;
-    }
-
-    final OuterSenderSubscriber senderSubscriber = this.senderSubscriber;
-
-    int m = 1;
-    boolean upstreamDone = this.done;
-    boolean downstreamDone = senderSubscriber.done;
-
-    for (;;) {
-
-      if (upstreamDone && downstreamDone) {
-        this.requested = STATE_TERMINATED;
-
-        this.activeStreams.remove(this.streamId, this);
-      }
-
-
-      m = WIP.addAndGet(this, -m);
-      if (m == 0) {
-        return;
-      }
-      upstreamDone = this.done;
-      downstreamDone = senderSubscriber.done;
+    if ((state & FLAG_FIRST) == FLAG_FIRST) {
+      this.actual.onComplete();
     }
   }
 
@@ -348,35 +337,45 @@ public class RequestChannelSubscriber extends Flux<Payload>
   }
 
   @Override
-  public void reassemble(ByteBuf dataAndMetadata, boolean hasFollows) {
+  public void reassemble(ByteBuf dataAndMetadata, boolean hasFollows, boolean terminal) {
     final CompositeByteBuf frames = this.frames.addComponent(true, dataAndMetadata);
 
     if (!hasFollows) {
+      Payload payload;
+      try {
+        payload = this.payloadDecoder.apply(frames);
+        ReferenceCountUtil.safeRelease(frames);
+        this.frames = null;
+      } catch (Throwable t) {
+        ReferenceCountUtil.safeRelease(frames);
+        Exceptions.throwIfFatal(t);
+        this.cancel();
+        final ByteBuf completeFrame = CancelFrameFlyweight.encode(this.allocator, this.streamId);
+        this.sendProcessor.onNext(completeFrame);
+        return;
+      }
+
       if (this.senderSubscriber == null) {
-        try {
-          final OuterSenderSubscriber senderSubscriber = new OuterSenderSubscriber();
-          this.senderSubscriber = senderSubscriber;
-          Payload firstPayload = this.payloadDecoder.apply(frames);
-          ReferenceCountUtil.safeRelease(frames);
-          this.frames = null;
-          Flux<Payload> source = this.handler.requestChannel(firstPayload, this);
-          source.subscribe(senderSubscriber);
-        } catch (Throwable t) {
-          ReferenceCountUtil.safeRelease(frames);
-          Exceptions.throwIfFatal(t);
-          this.cancel(t);
-        }
+        final OuterSenderSubscriber senderSubscriber =
+            new OuterSenderSubscriber(
+                this,
+                payload,
+                this.payloadDecoder,
+                this.mtu,
+                this.sendProcessor,
+                this.activeStreams,
+                this.allocator,
+                this.errorConsumer);
+        this.senderSubscriber = senderSubscriber;
+
+        Flux<Payload> source = this.handler.requestChannel(payload, this);
+        source.subscribe(senderSubscriber);
       } else {
-        try {
-          Payload firstPayload = this.payloadDecoder.apply(frames);
-          ReferenceCountUtil.safeRelease(frames);
-          Flux<Payload> source = this.handler.requestChannel(firstPayload, this);
-          source.subscribe(senderSubscriber);
-        } catch (Throwable t) {
-          ReferenceCountUtil.safeRelease(frames);
-          Exceptions.throwIfFatal(t);
-          this.onError(t);
-        }
+        this.onNext(payload);
+      }
+
+      if (terminal) {
+        this.onComplete();
       }
     }
   }
@@ -386,17 +385,31 @@ public class RequestChannelSubscriber extends Flux<Payload>
     final RequestChannelSubscriber parent;
     final PayloadDecoder payloadDecoder;
     final UnboundedProcessor<ByteBuf> sendProcessor;
+    final IntObjectMap<Reassemble<?>> activeStreams;
     final ByteBufAllocator allocator;
-    final RSocket handler;
+    final Consumer<? super Throwable> errorConsumer;
     final int mtu;
 
     Payload firstPayload;
 
     boolean done;
-    Throwable t;
 
-    OuterSenderSubscriber(RequestChannelSubscriber parent, Payload firstPayload) {
+    OuterSenderSubscriber(
+        RequestChannelSubscriber parent,
+        Payload firstPayload,
+        PayloadDecoder payloadDecoder,
+        int mtu,
+        UnboundedProcessor<ByteBuf> sendProcessor,
+        IntObjectMap<Reassemble<?>> activeStreams,
+        ByteBufAllocator allocator,
+        Consumer<? super Throwable> errorConsumer) {
       this.parent = parent;
+      this.payloadDecoder = payloadDecoder;
+      this.mtu = mtu;
+      this.sendProcessor = sendProcessor;
+      this.activeStreams = activeStreams;
+      this.allocator = allocator;
+      this.errorConsumer = errorConsumer;
 
       this.firstPayload = firstPayload;
     }
@@ -409,7 +422,7 @@ public class RequestChannelSubscriber extends Flux<Payload>
     @Override
     public void onNext(Payload p) {
       final RequestChannelSubscriber parent = this.parent;
-      if (parent.requested == STATE_TERMINATED) {
+      if (parent.requested == STATE_TERMINATED || this.done) {
         ReferenceCountUtil.safeRelease(parent);
         return;
       }
@@ -422,8 +435,8 @@ public class RequestChannelSubscriber extends Flux<Payload>
         parent.cancel();
 
         final IllegalReferenceCountException t = new IllegalReferenceCountException(0);
-        final ByteBuf errorFrame = ErrorFrameFlyweight.encode(allocator, streamId, t);
         this.errorConsumer.accept(t);
+        final ByteBuf errorFrame = ErrorFrameFlyweight.encode(allocator, streamId, t);
         sender.onNext(errorFrame);
       }
 
@@ -459,8 +472,8 @@ public class RequestChannelSubscriber extends Flux<Payload>
             parent.cancel();
 
             final Throwable t = new IllegalArgumentException("Too Big Payload size");
-            final ByteBuf errorFrame = ErrorFrameFlyweight.encode(allocator, streamId, t);
             this.errorConsumer.accept(t);
+            final ByteBuf errorFrame = ErrorFrameFlyweight.encode(allocator, streamId, t);
             sender.onNext(errorFrame);
 
           } else {
@@ -491,9 +504,24 @@ public class RequestChannelSubscriber extends Flux<Payload>
     public void onError(Throwable t) {
       this.errorConsumer.accept(t);
 
-      if (REQUESTED.getAndSet(this.parent, STATE_TERMINATED) == STATE_TERMINATED) {
+      if (this.done) {
+        Operators.onErrorDropped(t, Context.empty());
+      }
+
+      this.done = true;
+
+      long state = REQUESTED.getAndSet(this.parent, STATE_TERMINATED);
+      if (state == STATE_TERMINATED) {
         Operators.onErrorDropped(t, Context.empty());
         return;
+      }
+
+      if ((state & FLAG_FIRST) != FLAG_FIRST) {
+        final Payload firstPayload = this.firstPayload;
+        this.firstPayload = null;
+        if (firstPayload != null && firstPayload.refCnt() > 0) {
+          ReferenceCountUtil.safeRelease(firstPayload);
+        }
       }
 
       final int streamId = this.parent.streamId;
@@ -507,57 +535,150 @@ public class RequestChannelSubscriber extends Flux<Payload>
     @Override
     public void onComplete() {
       final RequestChannelSubscriber parent = this.parent;
-      if (REQUESTED.getAndSet(parent, STATE_TERMINATED) == STATE_TERMINATED) {
+
+      long state = parent.requested;
+      final boolean done = this.done;
+
+      if (state == STATE_TERMINATED || done) {
         return;
       }
 
+      boolean terminal;
+      for (; ; ) {
+        this.done = true;
 
-      final ByteBuf completeFrame = PayloadFrameFlyweight.encodeComplete(this.allocator, parent.streamId);
+        terminal = (state & FLAG_HALF_CLOSED) == FLAG_HALF_CLOSED && parent.done;
+
+        if (REQUESTED.compareAndSet(
+            parent, state, terminal ? STATE_TERMINATED : state | FLAG_FIRST | FLAG_HALF_CLOSED)) {
+          break;
+        }
+
+        state = parent.requested;
+
+        if (state == STATE_TERMINATED) {
+          return;
+        }
+      }
+
+      final int streamId = parent.streamId;
+
+      if (terminal) {
+        parent.activeStreams.remove(streamId, parent);
+      }
+
+      final ByteBuf completeFrame =
+          PayloadFrameFlyweight.encodeComplete(this.allocator, parent.streamId);
       this.sendProcessor.onNext(completeFrame);
-
-      parent.tryTerminate();
     }
 
     @Override
     public void request(long n) {
-      long current;
-      long next;
-      for (; ; ) {
-        current = this.requested;
+      final RequestChannelSubscriber parent = this.parent;
+      long state = parent.requested;
 
-        if (current <= STATE_SUBSCRIBED_RECEIVED_MAX) {
-          return;
-        }
-
-        if (current == FLAG_SUBSCRIBED) {
-          this.s.request(n);
-          return;
-        }
-
-        next = Operators.addCap(current, n);
-
-        if (REQUESTED.compareAndSet(this, current, next)) {
-          return;
-        }
-      }
-    }
-
-    @Override
-    public void cancel() {
-      long state = REQUESTED.getAndSet(this, STATE_TERMINATED);
       if (state == STATE_TERMINATED) {
         return;
       }
 
-      final CompositeByteBuf frames = this.frames;
-      if (frames != null && frames.refCnt() > 0) {
-        ReferenceCountUtil.safeRelease(frames);
+      final Payload firstPayload = this.firstPayload;
+
+      boolean done = parent.done;
+      boolean hasSentFirst;
+      for (; ; ) {
+        if (hasSentFirst = (state & FLAG_FIRST) == FLAG_FIRST) {
+          // no need to send any frames anymore since the upstream is already done
+          if (done) {
+            return;
+          }
+
+          break;
+        }
+
+        this.firstPayload = null;
+
+        if (REQUESTED.compareAndSet(parent, state, state | FLAG_FIRST)) {
+          break;
+        }
+
+        state = parent.requested;
+        done = parent.done;
+
+        if (state == STATE_TERMINATED) {
+          return;
+        }
       }
 
-      if (state <= FLAG_SUBSCRIBED) {
-        this.activeStreams.remove(this.streamId, this);
-        this.s.cancel();
+      if (!hasSentFirst) {
+        final CoreSubscriber<? super Payload> actual = parent.actual;
+
+        actual.onNext(firstPayload);
+
+        if (done) {
+          Throwable t = parent.t;
+          if (t != null) {
+            actual.onError(t);
+          } else {
+            actual.onComplete();
+          }
+        }
       }
+
+      final ByteBuf cancelFrame = RequestNFrameFlyweight.encode(this.allocator, parent.streamId, n);
+      this.sendProcessor.onNext(cancelFrame);
+    }
+
+    @Override
+    // upstream cancellation
+    public void cancel() {
+      final RequestChannelSubscriber parent = this.parent;
+
+      long state = parent.requested;
+
+      if (state == STATE_TERMINATED) {
+        return;
+      }
+
+      final Payload firstPayload = this.firstPayload;
+      final boolean done = parent.done;
+
+      if (done) {
+        return;
+      }
+
+      boolean terminal;
+      for (; ; ) {
+        this.firstPayload = null;
+        parent.done = true;
+
+        terminal = (state & FLAG_HALF_CLOSED) == FLAG_HALF_CLOSED && this.done;
+
+        if (REQUESTED.compareAndSet(
+            parent, state, terminal ? STATE_TERMINATED : state | FLAG_FIRST | FLAG_HALF_CLOSED)) {
+          break;
+        }
+
+        state = parent.requested;
+
+        if (state == STATE_TERMINATED) {
+          return;
+        }
+      }
+
+      if ((state & FLAG_FIRST) != FLAG_FIRST) {
+        if (firstPayload != null && firstPayload.refCnt() > 0) {
+          ReferenceCountUtil.safeRelease(firstPayload);
+        }
+      }
+
+      final int streamId = parent.streamId;
+
+      if (terminal) {
+        parent.activeStreams.remove(streamId, parent);
+      }
+
+      final ByteBuf completeFrame = CancelFrameFlyweight.encode(this.allocator, streamId);
+      this.sendProcessor.onNext(completeFrame);
     }
   }
 }

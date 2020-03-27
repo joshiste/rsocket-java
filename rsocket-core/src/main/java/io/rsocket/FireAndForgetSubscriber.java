@@ -15,13 +15,13 @@ import reactor.core.publisher.Mono;
 import reactor.core.publisher.Operators;
 import reactor.util.context.Context;
 
-final class FireAndForgetSubscriber implements CoreSubscriber<Void>, Reassemble {
+final class FireAndForgetSubscriber implements CoreSubscriber<Void>, Reassemble<Void> {
 
   final int streamId;
   final ByteBufAllocator allocator;
   final Consumer<? super Throwable> errorConsumer;
   final PayloadDecoder payloadDecoder;
-  final IntObjectMap<? super Subscription> activeStreams;
+  final IntObjectMap<Reassemble<?>> activeStreams;
   final RSocket handler;
 
   final CompositeByteBuf frames;
@@ -48,7 +48,7 @@ final class FireAndForgetSubscriber implements CoreSubscriber<Void>, Reassemble 
       ByteBufAllocator allocator,
       PayloadDecoder payloadDecoder,
       Consumer<? super Throwable> errorConsumer,
-      IntObjectMap<? super Subscription> activeStreams,
+      IntObjectMap<Reassemble<?>> activeStreams,
       RSocket handler) {
     this.streamId = streamId;
     this.allocator = allocator;
@@ -70,6 +70,11 @@ final class FireAndForgetSubscriber implements CoreSubscriber<Void>, Reassemble 
 
   @Override
   public void onError(Throwable t) {
+    final CompositeByteBuf frames = this.frames;
+    if (frames != null && frames.refCnt() > 0) {
+      ReferenceCountUtil.safeRelease(frames);
+    }
+
     this.errorConsumer.accept(t);
     Operators.onErrorDropped(t, Context.empty());
   }
@@ -83,7 +88,7 @@ final class FireAndForgetSubscriber implements CoreSubscriber<Void>, Reassemble 
   }
 
   @Override
-  public void reassemble(ByteBuf dataAndMetadata, boolean hasFollows) {
+  public void reassemble(ByteBuf dataAndMetadata, boolean hasFollows, boolean terminal) {
     if (state == STATE_TERMINATED) {
       ReferenceCountUtil.safeRelease(dataAndMetadata);
     }
@@ -113,6 +118,9 @@ final class FireAndForgetSubscriber implements CoreSubscriber<Void>, Reassemble 
       return;
     }
 
-    ReferenceCountUtil.safeRelease(this.frames);
+    final CompositeByteBuf frames = this.frames;
+    if (frames != null && frames.refCnt() > 0) {
+      ReferenceCountUtil.safeRelease(frames);
+    }
   }
 }

@@ -17,13 +17,12 @@ import io.rsocket.internal.UnboundedProcessor;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.function.Consumer;
 import org.reactivestreams.Subscription;
-import reactor.core.CoreSubscriber;
 import reactor.core.Exceptions;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Operators;
 import reactor.util.context.Context;
 
-public class RequestStreamSubscriber implements CoreSubscriber<Payload>, Reassemble {
+public class RequestStreamSubscriber implements Reassemble<Payload> {
 
   final int streamId;
   final long firstRequest;
@@ -31,7 +30,7 @@ public class RequestStreamSubscriber implements CoreSubscriber<Payload>, Reassem
   final Consumer<? super Throwable> errorConsumer;
   final PayloadDecoder payloadDecoder;
   final int mtu;
-  final IntObjectMap<? super Subscription> activeStreams;
+  final IntObjectMap<Reassemble<?>> activeStreams;
   final UnboundedProcessor<ByteBuf> sendProcessor;
 
   final RSocket handler;
@@ -55,7 +54,7 @@ public class RequestStreamSubscriber implements CoreSubscriber<Payload>, Reassem
       ByteBuf firstFrame,
       int mtu,
       Consumer<? super Throwable> errorConsumer,
-      IntObjectMap<? super Subscription> activeStreams,
+      IntObjectMap<Reassemble<?>> activeStreams,
       UnboundedProcessor<ByteBuf> sendProcessor,
       RSocket handler) {
     this.streamId = streamId;
@@ -76,7 +75,7 @@ public class RequestStreamSubscriber implements CoreSubscriber<Payload>, Reassem
       ByteBufAllocator allocator,
       int mtu,
       Consumer<? super Throwable> errorConsumer,
-      IntObjectMap<? super Subscription> activeStreams,
+      IntObjectMap<Reassemble<?>> activeStreams,
       UnboundedProcessor<ByteBuf> sendProcessor) {
     this.streamId = streamId;
     this.firstRequest = firstRequest;
@@ -207,6 +206,11 @@ public class RequestStreamSubscriber implements CoreSubscriber<Payload>, Reassem
       return;
     }
 
+    final CompositeByteBuf frames = this.frames;
+    if (frames != null && frames.refCnt() > 0) {
+      ReferenceCountUtil.safeRelease(frames);
+    }
+
     final int streamId = this.streamId;
 
     this.activeStreams.remove(streamId, this);
@@ -277,7 +281,7 @@ public class RequestStreamSubscriber implements CoreSubscriber<Payload>, Reassem
   }
 
   @Override
-  public void reassemble(ByteBuf dataAndMetadata, boolean hasFollows) {
+  public void reassemble(ByteBuf dataAndMetadata, boolean hasFollows, boolean terminal) {
     final CompositeByteBuf frames = this.frames.addComponent(true, dataAndMetadata);
 
     if (!hasFollows) {
