@@ -428,30 +428,30 @@ class RSocketResponder implements ResponderRSocket {
     if (activeStreams.containsKey(streamId)) {
       if (FrameHeaderFlyweight.hasFollows(frame)) {
         RequestStreamSubscriber subscriber =
-                new RequestStreamSubscriber(
-                        streamId,
-                        initialRequestN == Integer.MAX_VALUE ? Long.MAX_VALUE : initialRequestN,
-                        this.allocator,
-                        this.payloadDecoder,
-                        ReassemblyUtils.dataAndMetadata(frame),
-                        this.mtu,
-                        this.errorConsumer,
-                        this.sendingSubscriptions,
-                        this.sendProcessor,
-                        this);
+            new RequestStreamSubscriber(
+                streamId,
+                initialRequestN == Integer.MAX_VALUE ? Long.MAX_VALUE : initialRequestN,
+                this.allocator,
+                this.payloadDecoder,
+                ReassemblyUtils.dataAndMetadata(frame),
+                this.mtu,
+                this.errorConsumer,
+                this.sendingSubscriptions,
+                this.sendProcessor,
+                this);
         if (activeStreams.putIfAbsent(streamId, subscriber) != null) {
           subscriber.cancel();
         }
       } else {
         RequestStreamSubscriber subscriber =
-                new RequestStreamSubscriber(
-                        streamId,
-                        initialRequestN == Integer.MAX_VALUE ? Long.MAX_VALUE : initialRequestN,
-                        this.allocator,
-                        this.mtu,
-                        this.errorConsumer,
-                        this.sendingSubscriptions,
-                        this.sendProcessor);
+            new RequestStreamSubscriber(
+                streamId,
+                initialRequestN == Integer.MAX_VALUE ? Long.MAX_VALUE : initialRequestN,
+                this.allocator,
+                this.mtu,
+                this.errorConsumer,
+                this.sendingSubscriptions,
+                this.sendProcessor);
         if (activeStreams.putIfAbsent(streamId, subscriber) == null) {
           this.requestResponse(payloadDecoder.apply(frame)).subscribe(subscriber);
         }

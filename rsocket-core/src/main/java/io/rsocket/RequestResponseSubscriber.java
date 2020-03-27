@@ -107,8 +107,7 @@ public class RequestResponseSubscriber implements CoreSubscriber<Payload>, Reass
     if (p != null) {
       if (p.refCnt() <= 0) {
         final IllegalReferenceCountException t = new IllegalReferenceCountException(0);
-        final ByteBuf errorFrame =
-            ErrorFrameFlyweight.encode(allocator, streamId, t);
+        final ByteBuf errorFrame = ErrorFrameFlyweight.encode(allocator, streamId, t);
         errorConsumer.accept(t);
         sender.onNext(errorFrame);
       }

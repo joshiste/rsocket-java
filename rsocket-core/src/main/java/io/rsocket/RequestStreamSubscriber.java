@@ -14,15 +14,14 @@ import io.rsocket.frame.FrameType;
 import io.rsocket.frame.PayloadFrameFlyweight;
 import io.rsocket.frame.decoder.PayloadDecoder;
 import io.rsocket.internal.UnboundedProcessor;
+import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.function.Consumer;
 import org.reactivestreams.Subscription;
 import reactor.core.CoreSubscriber;
 import reactor.core.Exceptions;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Operators;
 import reactor.util.context.Context;
-
-import java.util.concurrent.atomic.AtomicLongFieldUpdater;
-import java.util.function.Consumer;
 
 public class RequestStreamSubscriber implements CoreSubscriber<Payload>, Reassemble {
 
@@ -49,16 +48,16 @@ public class RequestStreamSubscriber implements CoreSubscriber<Payload>, Reassem
   Subscription s;
 
   public RequestStreamSubscriber(
-          int streamId,
-          long firstRequest,
-          ByteBufAllocator allocator,
-          PayloadDecoder payloadDecoder,
-          ByteBuf firstFrame,
-          int mtu,
-          Consumer<? super Throwable> errorConsumer,
-          IntObjectMap<? super Subscription> activeStreams,
-          UnboundedProcessor<ByteBuf> sendProcessor,
-          RSocket handler) {
+      int streamId,
+      long firstRequest,
+      ByteBufAllocator allocator,
+      PayloadDecoder payloadDecoder,
+      ByteBuf firstFrame,
+      int mtu,
+      Consumer<? super Throwable> errorConsumer,
+      IntObjectMap<? super Subscription> activeStreams,
+      UnboundedProcessor<ByteBuf> sendProcessor,
+      RSocket handler) {
     this.streamId = streamId;
     this.firstRequest = firstRequest;
     this.allocator = allocator;
@@ -134,8 +133,7 @@ public class RequestStreamSubscriber implements CoreSubscriber<Payload>, Reassem
       this.cancel();
 
       final IllegalReferenceCountException t = new IllegalReferenceCountException(0);
-      final ByteBuf errorFrame =
-          ErrorFrameFlyweight.encode(allocator, streamId, t);
+      final ByteBuf errorFrame = ErrorFrameFlyweight.encode(allocator, streamId, t);
       this.errorConsumer.accept(t);
       sender.onNext(errorFrame);
     }
