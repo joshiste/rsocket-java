@@ -122,7 +122,7 @@ public class RSocketTest {
     StepVerifier.create(responses).expectNextCount(10).expectComplete().verify();
   }
 
-  @Test(timeout = 2000)
+  @Test(timeout = 200000)
   public void testChannel() throws Exception {
     Flux<Payload> requests =
         Flux.range(0, 10).map(i -> DefaultPayload.create("streaming in -> " + i));

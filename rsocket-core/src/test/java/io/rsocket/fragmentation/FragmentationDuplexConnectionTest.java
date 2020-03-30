@@ -1,4 +1,4 @@
-///*
+/// *
 // * Copyright 2015-2018 the original author or authors.
 // *
 // * Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,32 +14,32 @@
 // * limitations under the License.
 // */
 //
-//package io.rsocket.fragmentation;
+// package io.rsocket.fragmentation;
 //
-//import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
-//import static org.assertj.core.api.Assertions.assertThatNullPointerException;
-//import static org.mockito.Mockito.*;
+// import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
+// import static org.assertj.core.api.Assertions.assertThatNullPointerException;
+// import static org.mockito.Mockito.*;
 //
-//import io.netty.buffer.ByteBuf;
-//import io.netty.buffer.ByteBufAllocator;
-//import io.netty.buffer.CompositeByteBuf;
-//import io.netty.buffer.Unpooled;
-//import io.rsocket.DuplexConnection;
-//import io.rsocket.frame.*;
-//import io.rsocket.util.DefaultPayload;
-//import java.util.Arrays;
-//import java.util.List;
-//import java.util.concurrent.ThreadLocalRandom;
-//import org.junit.Assert;
-//import org.junit.jupiter.api.DisplayName;
-//import org.junit.jupiter.api.Test;
-//import org.mockito.ArgumentCaptor;
-//import org.reactivestreams.Publisher;
-//import reactor.core.publisher.Flux;
-//import reactor.core.publisher.Mono;
-//import reactor.test.StepVerifier;
+// import io.netty.buffer.ByteBuf;
+// import io.netty.buffer.ByteBufAllocator;
+// import io.netty.buffer.CompositeByteBuf;
+// import io.netty.buffer.Unpooled;
+// import io.rsocket.DuplexConnection;
+// import io.rsocket.frame.*;
+// import io.rsocket.util.DefaultPayload;
+// import java.util.Arrays;
+// import java.util.List;
+// import java.util.concurrent.ThreadLocalRandom;
+// import org.junit.Assert;
+// import org.junit.jupiter.api.DisplayName;
+// import org.junit.jupiter.api.Test;
+// import org.mockito.ArgumentCaptor;
+// import org.reactivestreams.Publisher;
+// import reactor.core.publisher.Flux;
+// import reactor.core.publisher.Mono;
+// import reactor.test.StepVerifier;
 //
-//final class FragmentationDuplexConnectionTest {
+// final class FragmentationDuplexConnectionTest {
 //  private static byte[] data = new byte[1024];
 //  private static byte[] metadata = new byte[1024];
 //
@@ -310,7 +310,8 @@
 //
 //    when(delegate.onClose()).thenReturn(Mono.never());
 //
-//    new FragmentationDuplexConnection(delegate, allocator, 64, false, "").sendOne(encode.retain());
+//    new FragmentationDuplexConnection(delegate, allocator, 64, false,
+// "").sendOne(encode.retain());
 //
 //    verify(delegate).send(publishers.capture());
 //
@@ -323,4 +324,4 @@
 //            })
 //        .verifyComplete();
 //  }
-//}
+// }

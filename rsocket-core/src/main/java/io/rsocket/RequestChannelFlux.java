@@ -1,5 +1,8 @@
 package io.rsocket;
 
+import static io.rsocket.fragmentation.FragmentationUtils.isFragmentable;
+import static io.rsocket.fragmentation.FragmentationUtils.isValid;
+
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.CompositeByteBuf;
@@ -8,9 +11,9 @@ import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.fragmentation.FragmentationUtils;
+import io.rsocket.fragmentation.ReassemblyUtils;
 import io.rsocket.frame.CancelFrameFlyweight;
 import io.rsocket.frame.ErrorFrameFlyweight;
-import io.rsocket.frame.FrameLengthFlyweight;
 import io.rsocket.frame.FrameType;
 import io.rsocket.frame.PayloadFrameFlyweight;
 import io.rsocket.frame.RequestChannelFrameFlyweight;
@@ -39,13 +42,13 @@ final class RequestChannelFlux extends Flux<Payload>
   final StateAware parent;
   final StreamIdSupplier streamIdSupplier;
   final IntObjectMap<Reassemble<?>> activeStreams;
-  final IntObjectMap<Subscription> activeSubscriptions;
   final UnboundedProcessor<ByteBuf> sendProcessor;
   final PayloadDecoder payloadDecoder;
 
   static final long STATE_UNSUBSCRIBED = -2;
   static final long STATE_SUBSCRIBED = -1;
   static final long STATE_WIRED = -3;
+  static final long STATE_HALF_CLOSED = Long.MIN_VALUE + 1;
   static final long STATE_TERMINATED = Long.MIN_VALUE;
 
   volatile long requested;
@@ -56,6 +59,7 @@ final class RequestChannelFlux extends Flux<Payload>
   InnerConnectorSubscriber connector;
 
   boolean first = true;
+  boolean done;
 
   RequestChannelFlux(
       ByteBufAllocator allocator,
@@ -64,7 +68,6 @@ final class RequestChannelFlux extends Flux<Payload>
       StateAware parent,
       StreamIdSupplier streamIdSupplier,
       IntObjectMap<Reassemble<?>> activeSubscribers,
-      IntObjectMap<Subscription> activeSubscriptions,
       UnboundedProcessor<ByteBuf> sendProcessor,
       PayloadDecoder payloadDecoder) {
     this.allocator = allocator;
@@ -73,7 +76,6 @@ final class RequestChannelFlux extends Flux<Payload>
     this.parent = parent;
     this.streamIdSupplier = streamIdSupplier;
     this.activeStreams = activeSubscribers;
-    this.activeSubscriptions = activeSubscriptions;
     this.sendProcessor = sendProcessor;
     this.payloadDecoder = payloadDecoder;
 
@@ -99,15 +101,15 @@ final class RequestChannelFlux extends Flux<Payload>
 
   @Override
   public void onNext(Payload p) {
-    if (this.isTerminated()) {
+    if (this.isTerminated() || this.done) {
       ReferenceCountUtil.safeRelease(p);
       return;
     }
     final UnboundedProcessor<ByteBuf> sender = this.sendProcessor;
     final ByteBufAllocator allocator = this.allocator;
     final IntObjectMap<Reassemble<?>> as = this.activeStreams;
-    final IntObjectMap<Subscription> ass = this.activeSubscriptions;
     final int mtu = this.mtu;
+    final InnerConnectorSubscriber connector = this.connector;
 
     int streamId = this.streamId;
     if (this.first) {
@@ -116,8 +118,8 @@ final class RequestChannelFlux extends Flux<Payload>
       if (p.refCnt() <= 0) {
         final Throwable t = new IllegalReferenceCountException(0);
         this.requested = STATE_TERMINATED;
-        this.connector.s.cancel();
-        this.connector.actual.onError(t);
+        connector.s.cancel();
+        connector.actual.onError(t);
         return;
       }
 
@@ -132,10 +134,9 @@ final class RequestChannelFlux extends Flux<Payload>
 
         if (requested == STATE_TERMINATED) {
           if (firstLoop) {
-            ReferenceCountUtil.safeRelease(p);
+            p.release();
           } else {
-            if (as.remove(streamId, this.connector)) {
-              ass.remove(streamId, this.connector);
+            if (as.remove(streamId, connector)) {
               final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
               sender.onNext(cancelFrame);
             }
@@ -147,21 +148,32 @@ final class RequestChannelFlux extends Flux<Payload>
           final Throwable throwable = parent.checkAvailable();
           if (throwable != null) {
             this.requested = STATE_TERMINATED;
-            this.connector.s.cancel();
-            this.connector.actual.onError(throwable);
+            connector.s.cancel();
+            connector.actual.onError(throwable);
             return;
           }
           try {
             final boolean hasMetadata = p.hasMetadata();
+            final ByteBuf data = p.data();
+            final ByteBuf metadata = p.metadata();
+
+            if (hasMetadata ? !isValid(mtu, data, metadata) : !isValid(mtu, data)) {
+              final Throwable t = new IllegalArgumentException("Too Big Payload size");
+
+              p.release();
+              this.requested = STATE_TERMINATED;
+              connector.s.cancel();
+              connector.actual.onError(t);
+
+              return;
+            }
 
             streamId = this.streamIdSupplier.nextStreamId(as);
-
             this.streamId = streamId;
 
-            if (mtu > 0) {
-              final ByteBuf slicedData = p.data().retainedSlice();
-              final ByteBuf slicedMetadata =
-                  hasMetadata ? p.metadata().retainedSlice() : Unpooled.EMPTY_BUFFER;
+            if (hasMetadata ? isFragmentable(mtu, data, metadata) : isFragmentable(mtu, data)) {
+              final ByteBuf slicedData = data.slice();
+              final ByteBuf slicedMetadata = hasMetadata ? metadata.slice() : Unpooled.EMPTY_BUFFER;
 
               final ByteBuf first =
                   FragmentationUtils.encodeFirstFragment(
@@ -173,8 +185,7 @@ final class RequestChannelFlux extends Flux<Payload>
                       slicedMetadata,
                       slicedData);
 
-              as.put(streamId, this.connector);
-              ass.put(streamId, this.connector);
+              as.put(streamId, connector);
               sender.onNext(first);
 
               while (slicedData.isReadable() || slicedMetadata.isReadable()) {
@@ -184,28 +195,14 @@ final class RequestChannelFlux extends Flux<Payload>
                         mtu,
                         streamId,
                         false, // TODO: Should be a different flag in case of the scalar source or
-                        // sync source of a single element
+                        // we know in advance upstream is mono
                         slicedMetadata,
                         slicedData);
                 sender.onNext(following);
               }
             } else {
-              final ByteBuf data = p.data();
-              final ByteBuf metadata = p.metadata();
-
-              if (((data.readableBytes() + (hasMetadata ? metadata.readableBytes() : 0))
-                      & ~FrameLengthFlyweight.FRAME_LENGTH_MASK)
-                  != 0) {
-                final Throwable t = new IllegalArgumentException("Too Big Payload size");
-                this.requested = STATE_TERMINATED;
-                this.connector.s.cancel();
-                this.connector.actual.onError(t);
-                ReferenceCountUtil.safeRelease(p);
-                return;
-              }
-
-              final ByteBuf slicedData = data.retainedSlice();
-              final ByteBuf slicedMetadata = hasMetadata ? metadata.retainedSlice() : null;
+              final ByteBuf retainedSlicedData = data.retainedSlice();
+              final ByteBuf retainedSlicedMetadata = hasMetadata ? metadata.retainedSlice() : null;
 
               final ByteBuf requestFrame =
                   RequestChannelFrameFlyweight.encode(
@@ -215,30 +212,28 @@ final class RequestChannelFlux extends Flux<Payload>
                       false, // TODO: Should be a different flag in case of the scalar source or
                       // sync source of a single element
                       (int) (requested & Integer.MAX_VALUE),
-                      slicedMetadata,
-                      slicedData);
+                      retainedSlicedMetadata,
+                      retainedSlicedData);
 
-              as.put(streamId, this.connector);
-              ass.put(streamId, this.connector);
+              as.put(streamId, connector);
               sender.onNext(requestFrame);
             }
 
-            ReferenceCountUtil.safeRelease(p);
+            p.release();
           } catch (Throwable e) {
             this.requested = STATE_TERMINATED;
 
             ReferenceCountUtil.safeRelease(p);
             Exceptions.throwIfFatal(e);
 
-            this.connector.s.cancel();
+            connector.s.cancel();
 
-            if (as.remove(streamId, this.connector)) {
-              ass.remove(streamId, this.connector);
+            if (as.remove(streamId, connector)) {
               final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
               sender.onNext(cancelFrame);
             }
 
-            this.connector.actual.onError(e);
+            connector.actual.onError(e);
 
             return;
           }
@@ -258,17 +253,29 @@ final class RequestChannelFlux extends Flux<Payload>
         final Throwable t = new IllegalReferenceCountException(0);
         final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
         sender.onNext(cancelFrame);
-        this.connector.onError(t);
+        connector.onError(t);
         return;
       }
 
       try {
         final boolean hasMetadata = p.hasMetadata();
+        final ByteBuf data = p.data();
+        final ByteBuf metadata = p.metadata();
 
-        if (mtu > 0) {
-          final ByteBuf slicedData = p.data().retainedSlice();
-          final ByteBuf slicedMetadata =
-              hasMetadata ? p.metadata().retainedSlice() : Unpooled.EMPTY_BUFFER;
+        if (hasMetadata ? !isValid(mtu, data, metadata) : !isValid(mtu, data)) {
+          final Throwable t = new IllegalArgumentException("Too Big Payload size");
+          final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
+
+          p.release();
+
+          sender.onNext(cancelFrame);
+          connector.onError(t);
+          return;
+        }
+
+        if (hasMetadata ? isFragmentable(mtu, data, metadata) : isFragmentable(mtu, data)) {
+          final ByteBuf slicedData = p.data().slice();
+          final ByteBuf slicedMetadata = hasMetadata ? p.metadata().slice() : Unpooled.EMPTY_BUFFER;
 
           final ByteBuf first =
               FragmentationUtils.encodeFirstFragment(
@@ -282,31 +289,23 @@ final class RequestChannelFlux extends Flux<Payload>
             sender.onNext(following);
           }
         } else {
-          final ByteBuf data = p.data();
-          final ByteBuf metadata = p.metadata();
-
-          if (((data.readableBytes() + (hasMetadata ? metadata.readableBytes() : 0))
-                  & ~FrameLengthFlyweight.FRAME_LENGTH_MASK)
-              != 0) {
-            final Throwable t = new IllegalArgumentException("Too Big Payload size");
-            final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
-            sender.onNext(cancelFrame);
-            this.connector.onError(t);
-            ReferenceCountUtil.safeRelease(p);
-            return;
-          }
-
-          final ByteBuf slicedData = data.retainedSlice();
-          final ByteBuf slicedMetadata = hasMetadata ? metadata.retainedSlice() : null;
+          final ByteBuf retainedSlicedData = data.retainedSlice();
+          final ByteBuf retainedSlicedMetadata = hasMetadata ? metadata.retainedSlice() : null;
 
           final ByteBuf nextFrame =
               PayloadFrameFlyweight.encode(
-                  allocator, streamId, false, false, true, slicedMetadata, slicedData);
+                  allocator,
+                  streamId,
+                  false,
+                  false,
+                  true,
+                  retainedSlicedMetadata,
+                  retainedSlicedData);
 
           sender.onNext(nextFrame);
         }
 
-        ReferenceCountUtil.safeRelease(p);
+        p.release();
       } catch (Throwable e) {
         ReferenceCountUtil.safeRelease(p);
 
@@ -315,46 +314,76 @@ final class RequestChannelFlux extends Flux<Payload>
         final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
         sender.onNext(cancelFrame);
 
-        this.connector.onError(e);
+        connector.onError(e);
       }
     }
   }
 
   @Override
   public void onError(Throwable t) {
+    if (this.isTerminated() || this.done) {
+      Operators.onErrorDropped(t, currentContext());
+      return;
+    }
+
+    this.done = true;
+
     long state = REQUESTED.getAndSet(this, STATE_TERMINATED);
     if (state == STATE_TERMINATED) {
       Operators.onErrorDropped(t, currentContext());
       return;
     }
 
-    if (state == STATE_WIRED) {
+    if (state <= STATE_WIRED) {
       final int streamId = this.streamId;
-      this.activeSubscriptions.remove(streamId, this.connector);
       this.activeStreams.remove(streamId, this.connector);
 
+      // propagates error to remote responder
       final ByteBuf errorFrame = ErrorFrameFlyweight.encode(this.allocator, streamId, t);
       this.sendProcessor.onNext(errorFrame);
     }
+
+    // propagates error to actual subscriber as well
     this.connector.actual.onError(t);
   }
 
   @Override
   public void onComplete() {
     long state = this.requested;
-    if (state == STATE_TERMINATED) {
+    if (state == STATE_TERMINATED || this.done) {
       return;
     }
 
-    if (state == STATE_WIRED) {
-      final int streamId = this.streamId;
-      this.activeSubscriptions.remove(streamId, this.connector);
+    this.done = true;
 
-      final ByteBuf completeFrame = PayloadFrameFlyweight.encodeComplete(this.allocator, streamId);
-      this.sendProcessor.onNext(completeFrame);
-    } else {
-      this.connector.actual.onError(new CancellationException("Empty Source"));
+    boolean terminal;
+    for (; ; ) {
+      terminal = state > STATE_WIRED || state == STATE_HALF_CLOSED;
+
+      if (REQUESTED.compareAndSet(this, state, terminal ? STATE_TERMINATED : STATE_HALF_CLOSED)) {
+        break;
+      }
+
+      state = this.requested;
+
+      if (state == STATE_TERMINATED) {
+        return;
+      }
     }
+
+    if (state > STATE_WIRED) {
+      this.connector.actual.onError(new CancellationException("Empty Source"));
+      return;
+    }
+
+    final int streamId = this.streamId;
+
+    if (terminal) {
+      this.activeStreams.remove(streamId, this.connector);
+    }
+
+    final ByteBuf completeFrame = PayloadFrameFlyweight.encodeComplete(this.allocator, streamId);
+    this.sendProcessor.onNext(completeFrame);
   }
 
   @Override
@@ -365,7 +394,7 @@ final class RequestChannelFlux extends Flux<Payload>
         && REQUESTED.compareAndSet(this, STATE_UNSUBSCRIBED, STATE_SUBSCRIBED)) {
       this.connector =
           new InnerConnectorSubscriber(
-              this, actual, activeStreams, activeSubscriptions, payloadDecoder, allocator);
+              this, actual, this.activeStreams, this.payloadDecoder, this.allocator);
       this.payloadPublisher.subscribe(this);
     } else {
       Operators.error(
@@ -384,7 +413,11 @@ final class RequestChannelFlux extends Flux<Payload>
     for (; ; ) {
       currentRequested = this.requested;
 
-      if (currentRequested == STATE_WIRED) {
+      if (currentRequested == STATE_WIRED || currentRequested == STATE_HALF_CLOSED) {
+        if (this.connector.done) {
+          return;
+        }
+
         final ByteBuf requestNFrame =
             RequestNFrameFlyweight.encode(this.allocator, this.streamId, n);
         this.sendProcessor.onNext(requestNFrame);
@@ -417,28 +450,36 @@ final class RequestChannelFlux extends Flux<Payload>
 
   @Override
   public final void cancel() {
-    final long state = REQUESTED.getAndSet(this, STATE_TERMINATED);
-    if (state != STATE_TERMINATED) {
-      final InnerConnectorSubscriber connector = this.connector;
-      connector.cancel();
-
-      if (state != STATE_WIRED) {
-        // no need to send anything, since we have not started a stream yet (no logical wire)
-        return;
-      }
-
-      final CompositeByteBuf frames = connector.frames;
-      connector.frames = null;
-      if (frames.refCnt() > 0) {
-        ReferenceCountUtil.safeRelease(frames);
-      }
-
-      final int streamId = this.streamId;
-      this.activeStreams.remove(streamId, connector);
-
-      final ByteBuf cancelFrame = CancelFrameFlyweight.encode(this.allocator, streamId);
-      this.sendProcessor.onNext(cancelFrame);
+    long state = this.requested;
+    if (state == STATE_TERMINATED) {
+      return;
     }
+
+    final InnerConnectorSubscriber connector = this.connector;
+    final CompositeByteBuf frames = connector.frames;
+    connector.frames = null;
+
+    state = REQUESTED.getAndSet(this, STATE_TERMINATED);
+    if (state == STATE_TERMINATED) {
+      return;
+    }
+
+    connector.s.cancel();
+
+    if (state != STATE_WIRED) {
+      // no need to send anything, since we have not started a stream yet (no logical wire)
+      return;
+    }
+
+    if (frames != null && frames.refCnt() > 0) {
+      ReferenceCountUtil.safeRelease(frames);
+    }
+
+    final int streamId = this.streamId;
+    this.activeStreams.remove(streamId, connector);
+
+    final ByteBuf cancelFrame = CancelFrameFlyweight.encode(this.allocator, streamId);
+    this.sendProcessor.onNext(cancelFrame);
   }
 
   boolean isTerminated() {
@@ -471,24 +512,22 @@ final class RequestChannelFlux extends Flux<Payload>
     final RequestChannelFlux parent;
     final CoreSubscriber<? super Payload> actual;
     final IntObjectMap<Reassemble<?>> activeStreams;
-    final IntObjectMap<Subscription> activeSubscriptions;
     final PayloadDecoder payloadDecoder;
     final ByteBufAllocator allocator;
 
     Subscription s;
     CompositeByteBuf frames;
+    boolean done;
 
     InnerConnectorSubscriber(
         RequestChannelFlux parent,
         CoreSubscriber<? super Payload> actual,
         IntObjectMap<Reassemble<?>> activeStreams,
-        IntObjectMap<Subscription> activeSubscriptions,
         PayloadDecoder payloadDecoder,
         ByteBufAllocator allocator) {
       this.parent = parent;
       this.actual = actual;
       this.activeStreams = activeStreams;
-      this.activeSubscriptions = activeSubscriptions;
       this.payloadDecoder = payloadDecoder;
       this.allocator = allocator;
     }
@@ -503,33 +542,60 @@ final class RequestChannelFlux extends Flux<Payload>
 
     @Override
     public final void onComplete() {
-      if (this.parent.isTerminated()) {
+      final RequestChannelFlux parent = this.parent;
+      long state = parent.requested;
+      if (state == STATE_TERMINATED || this.done) {
         return;
       }
 
-      this.activeStreams.remove(this.parent.streamId, this);
+      this.done = true;
+
+      boolean terminal;
+      for (; ; ) {
+        terminal = state > STATE_WIRED || parent.done;
+
+        if (REQUESTED.compareAndSet(
+            parent, state, terminal ? STATE_TERMINATED : STATE_HALF_CLOSED)) {
+          break;
+        }
+
+        state = parent.requested;
+
+        if (state == STATE_TERMINATED) {
+          return;
+        }
+      }
+
+      if (terminal) {
+        this.activeStreams.remove(parent.streamId, this);
+      }
 
       this.actual.onComplete();
     }
 
     @Override
     public final void onError(Throwable cause) {
-      Objects.requireNonNull(cause, "onError cannot be null");
-
-      if (REQUESTED.getAndSet(this.parent, STATE_TERMINATED) == STATE_TERMINATED) {
+      final RequestChannelFlux parent = this.parent;
+      if (parent.isTerminated() || this.done) {
         Operators.onErrorDropped(cause, currentContext());
         return;
       }
 
       final CompositeByteBuf frames = this.frames;
+      this.done = true;
       this.frames = null;
-      if (frames.refCnt() > 0) {
-        ReferenceCountUtil.safeRelease(frames);
+
+      if (REQUESTED.getAndSet(parent, STATE_TERMINATED) == STATE_TERMINATED) {
+        Operators.onErrorDropped(cause, currentContext());
+        return;
       }
 
-      final int streamId = this.parent.streamId;
+      if (frames != null && frames.refCnt() > 0) {
+        frames.release();
+      }
 
-      this.activeSubscriptions.remove(streamId, this);
+      final int streamId = parent.streamId;
+
       this.activeStreams.remove(streamId, this);
 
       this.s.cancel();
@@ -553,7 +619,35 @@ final class RequestChannelFlux extends Flux<Payload>
 
     @Override
     public void cancel() {
-      this.activeSubscriptions.remove(this.parent.streamId, this);
+      final RequestChannelFlux parent = this.parent;
+
+      long state = parent.requested;
+      if (state == STATE_TERMINATED) {
+        return;
+      }
+
+      parent.done = true;
+
+      boolean terminal;
+      for (; ; ) {
+        terminal = state > STATE_WIRED || this.done;
+
+        if (REQUESTED.compareAndSet(
+            parent, state, terminal ? STATE_TERMINATED : STATE_HALF_CLOSED)) {
+          break;
+        }
+
+        state = parent.requested;
+
+        if (state == STATE_TERMINATED) {
+          return;
+        }
+      }
+
+      if (terminal) {
+        this.activeStreams.remove(parent.streamId, parent);
+      }
+
       this.s.cancel();
     }
 
@@ -563,21 +657,36 @@ final class RequestChannelFlux extends Flux<Payload>
     }
 
     @Override
-    public void reassemble(ByteBuf dataAndMetadata, boolean hasFollows, boolean terminal) {
-      final CompositeByteBuf frames = this.frames;
+    public void reassemble(ByteBuf followingFrame, boolean hasFollows, boolean terminal) {
+      final RequestChannelFlux parent = this.parent;
+      if (parent.isTerminated() || this.done) {
+        return;
+      }
+
+      CompositeByteBuf frames = this.frames;
 
       if (frames == null) {
-        this.frames = this.allocator.compositeBuffer().addComponent(true, dataAndMetadata);
+        frames =
+            ReassemblyUtils.addFollowingFrame(this.allocator.compositeBuffer(), followingFrame);
+        this.frames = frames;
+
+        if (parent.isTerminated()) {
+          this.frames = null;
+          if (frames.refCnt() > 0) {
+            ReferenceCountUtil.safeRelease(frames);
+          }
+        }
+
         return;
       } else {
-        frames.addComponent(true, dataAndMetadata);
+        frames = ReassemblyUtils.addFollowingFrame(frames, followingFrame);
       }
 
       if (!hasFollows) {
         this.frames = null;
         try {
           this.onNext(this.payloadDecoder.apply(frames));
-          ReferenceCountUtil.safeRelease(frames);
+          frames.release();
 
           if (terminal) {
             this.onComplete();
@@ -586,7 +695,6 @@ final class RequestChannelFlux extends Flux<Payload>
           ReferenceCountUtil.safeRelease(frames);
           Exceptions.throwIfFatal(t);
 
-          RequestChannelFlux parent = this.parent;
           if (!parent.isTerminated()) {
             this.actual.onError(t);
           }

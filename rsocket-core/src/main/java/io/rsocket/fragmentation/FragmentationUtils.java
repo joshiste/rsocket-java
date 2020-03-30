@@ -4,6 +4,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.rsocket.frame.FrameHeaderFlyweight;
+import io.rsocket.frame.FrameLengthFlyweight;
 import io.rsocket.frame.FrameType;
 import io.rsocket.frame.PayloadFrameFlyweight;
 import io.rsocket.frame.RequestChannelFrameFlyweight;
@@ -12,6 +13,43 @@ import io.rsocket.frame.RequestResponseFrameFlyweight;
 import io.rsocket.frame.RequestStreamFrameFlyweight;
 
 public class FragmentationUtils {
+
+  public static boolean isValid(int mtu, ByteBuf data) {
+    return mtu > 0
+        || (((FrameHeaderFlyweight.size() + data.readableBytes())
+                & ~FrameLengthFlyweight.FRAME_LENGTH_MASK)
+            == 0);
+  }
+
+  public static boolean isValid(int mtu, ByteBuf data, ByteBuf metadata) {
+    return mtu > 0
+        || (((FrameHeaderFlyweight.size()
+                    + FrameHeaderFlyweight.size()
+                    + data.readableBytes()
+                    + metadata.readableBytes())
+                & ~FrameLengthFlyweight.FRAME_LENGTH_MASK)
+            == 0);
+  }
+
+  public static boolean isFragmentable(int mtu, ByteBuf data) {
+    if (mtu > 0) {
+      int remaining = mtu - FrameHeaderFlyweight.size();
+
+      return remaining < data.readableBytes();
+    }
+
+    return false;
+  }
+
+  public static boolean isFragmentable(int mtu, ByteBuf data, ByteBuf metadata) {
+    if (mtu > 0) {
+      int remaining = mtu - FrameHeaderFlyweight.size() - FrameHeaderFlyweight.size();
+
+      return remaining < (metadata.readableBytes() + data.readableBytes());
+    }
+
+    return false;
+  }
 
   public static ByteBuf encodeFollowsFragment(
       ByteBufAllocator allocator,

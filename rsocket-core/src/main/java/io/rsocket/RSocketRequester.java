@@ -26,7 +26,6 @@ import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.exceptions.ConnectionErrorException;
 import io.rsocket.exceptions.Exceptions;
-import io.rsocket.fragmentation.ReassemblyUtils;
 import io.rsocket.frame.ErrorFrameFlyweight;
 import io.rsocket.frame.FrameHeaderFlyweight;
 import io.rsocket.frame.FrameType;
@@ -46,7 +45,6 @@ import java.util.function.Consumer;
 import java.util.function.Supplier;
 import javax.annotation.Nullable;
 import org.reactivestreams.Publisher;
-import org.reactivestreams.Subscription;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -67,8 +65,7 @@ class RSocketRequester implements RSocket, StateAware {
   private final PayloadDecoder payloadDecoder;
   private final Consumer<Throwable> errorConsumer;
   private final StreamIdSupplier streamIdSupplier;
-  private final IntObjectMap<Subscription> activeSubscriptions;
-  private final IntObjectMap<Reassemble<?>> activeSubscribers;
+  private final IntObjectMap<Reassemble<?>> activeStreams;
   private final UnboundedProcessor<ByteBuf> sendProcessor;
   private final RequesterLeaseHandler leaseHandler;
   private final ByteBufAllocator allocator;
@@ -94,8 +91,7 @@ class RSocketRequester implements RSocket, StateAware {
     this.streamIdSupplier = streamIdSupplier;
     this.mtu = mtu;
     this.leaseHandler = leaseHandler;
-    this.activeSubscriptions = new SynchronizedIntObjectHashMap<>();
-    this.activeSubscribers = new SynchronizedIntObjectHashMap<>();
+    this.activeStreams = new SynchronizedIntObjectHashMap<>();
 
     // DO NOT Change the order here. The Send processor must be subscribed to before receiving
     this.sendProcessor = new UnboundedProcessor<>();
@@ -171,7 +167,7 @@ class RSocketRequester implements RSocket, StateAware {
         this.mtu,
         this,
         this.streamIdSupplier,
-        this.activeSubscribers,
+        this.activeStreams,
         this.sendProcessor);
   }
 
@@ -182,7 +178,7 @@ class RSocketRequester implements RSocket, StateAware {
         this.mtu,
         this,
         this.streamIdSupplier,
-        this.activeSubscribers,
+        this.activeStreams,
         this.sendProcessor,
         this.payloadDecoder);
   }
@@ -194,7 +190,7 @@ class RSocketRequester implements RSocket, StateAware {
         this.mtu,
         this,
         this.streamIdSupplier,
-        this.activeSubscribers,
+        this.activeStreams,
         this.sendProcessor,
         this.payloadDecoder);
   }
@@ -206,8 +202,7 @@ class RSocketRequester implements RSocket, StateAware {
         this.mtu,
         this,
         this.streamIdSupplier,
-        this.activeSubscribers,
-        this.activeSubscriptions,
+        this.activeStreams,
         this.sendProcessor,
         this.payloadDecoder);
   }
@@ -280,7 +275,7 @@ class RSocketRequester implements RSocket, StateAware {
 
   @SuppressWarnings({"rawtypes", "unchecked"})
   private void handleFrame(int streamId, FrameType type, ByteBuf frame) {
-    Reassemble receiver = activeSubscribers.get(streamId);
+    Reassemble receiver = activeStreams.get(streamId);
     if (receiver == null) {
       handleMissingResponseProcessor(streamId, type, frame);
     } else {
@@ -290,7 +285,7 @@ class RSocketRequester implements RSocket, StateAware {
           break;
         case NEXT_COMPLETE:
           if (receiver.isReassemblingNow()) {
-            receiver.reassemble(ReassemblyUtils.dataAndMetadata(frame), false, true);
+            receiver.reassemble(frame, false, true);
           } else {
             receiver.onNext(payloadDecoder.apply(frame));
             receiver.onComplete();
@@ -298,26 +293,21 @@ class RSocketRequester implements RSocket, StateAware {
           break;
         case CANCEL:
           {
-            Subscription sender = activeSubscriptions.remove(streamId);
-            if (sender != null) {
-              sender.cancel();
-            }
+            receiver.cancel();
             break;
           }
         case NEXT:
-          if (receiver.isReassemblingNow()) {
-            receiver.reassemble(ReassemblyUtils.dataAndMetadata(frame), false, false);
+          boolean hasFollows = FrameHeaderFlyweight.hasFollows(frame);
+          if (receiver.isReassemblingNow() || hasFollows) {
+            receiver.reassemble(frame, hasFollows, false);
           } else {
             receiver.onNext(payloadDecoder.apply(frame));
           }
           break;
         case REQUEST_N:
           {
-            Subscription sender = activeSubscriptions.get(streamId);
-            if (sender != null) {
-              int n = RequestNFrameFlyweight.requestN(frame);
-              sender.request(n >= Integer.MAX_VALUE ? Long.MAX_VALUE : n);
-            }
+            int n = RequestNFrameFlyweight.requestN(frame);
+            receiver.request(n >= Integer.MAX_VALUE ? Long.MAX_VALUE : n);
             break;
           }
         case COMPLETE:
@@ -388,32 +378,17 @@ class RSocketRequester implements RSocket, StateAware {
     connection.dispose();
     leaseHandler.dispose();
 
-    synchronized (activeSubscribers) {
-      activeSubscribers
-          .values()
-          .forEach(
-              receiver -> {
-                try {
-                  receiver.onError(e);
-                } catch (Throwable t) {
-                  errorConsumer.accept(t);
-                }
-              });
-    }
-    synchronized (activeSubscriptions) {
-      activeSubscriptions
-          .values()
-          .forEach(
-              sender -> {
-                try {
-                  sender.cancel();
-                } catch (Throwable t) {
-                  errorConsumer.accept(t);
-                }
-              });
-    }
-    activeSubscriptions.clear();
-    activeSubscribers.clear();
+    activeStreams
+        .values()
+        .forEach(
+            receiver -> {
+              try {
+                receiver.onError(e);
+              } catch (Throwable t) {
+                errorConsumer.accept(t);
+              }
+            });
+
     sendProcessor.dispose();
     errorConsumer.accept(e);
   }

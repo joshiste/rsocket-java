@@ -54,6 +54,8 @@ import reactor.util.retry.Retry;
 
 /** Factory for creating RSocket clients and servers. */
 public class RSocketFactory {
+  private static final int MIN_MTU_SIZE = 64;
+
   /**
    * Creates a factory that establishes client connections to other RSockets.
    *
@@ -373,6 +375,11 @@ public class RSocketFactory {
     }
 
     public ClientRSocketFactory fragment(int mtu) {
+      if (mtu > 0 && mtu < MIN_MTU_SIZE || mtu < 0) {
+        String msg =
+            String.format("smallest allowed mtu size is %d bytes, provided: %d", MIN_MTU_SIZE, mtu);
+        throw new IllegalArgumentException(msg);
+      }
       this.mtu = mtu;
       return this;
     }
@@ -521,7 +528,7 @@ public class RSocketFactory {
       }
 
       private Mono<DuplexConnection> newConnection() {
-        return Mono.fromSupplier(transportClient).flatMap(t -> t.connect(mtu));
+        return Mono.fromSupplier(transportClient).flatMap(ClientTransport::connect);
       }
     }
   }
@@ -598,6 +605,11 @@ public class RSocketFactory {
     }
 
     public ServerRSocketFactory fragment(int mtu) {
+      if (mtu > 0 && mtu < MIN_MTU_SIZE || mtu < 0) {
+        String msg =
+            String.format("smallest allowed mtu size is %d bytes, provided: %d", MIN_MTU_SIZE, mtu);
+        throw new IllegalArgumentException(msg);
+      }
       this.mtu = mtu;
       return this;
     }
@@ -803,7 +815,7 @@ public class RSocketFactory {
                     .flatMap(
                         transport ->
                             transport.start(
-                                duplexConnection -> acceptor(serverSetup, duplexConnection), mtu))
+                                duplexConnection -> acceptor(serverSetup, duplexConnection)))
                     .doOnNext(c -> c.onClose().doFinally(v -> serverSetup.dispose()).subscribe());
               }
             });

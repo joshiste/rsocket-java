@@ -25,6 +25,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.netty.buffer.UnpooledByteBufAllocator;
+import io.netty.util.ReferenceCountUtil;
 import io.rsocket.exceptions.Exceptions;
 import io.rsocket.exceptions.MissingLeaseException;
 import io.rsocket.frame.FrameHeaderFlyweight;
@@ -173,15 +174,15 @@ class RSocketLeaseTest {
   @ParameterizedTest
   @MethodSource("interactions")
   void requesterPresentLeaseRequestsAreAccepted(Function<RSocket, Publisher<?>> interaction) {
-    requesterLeaseHandler.receive(leaseFrame(5_000, 2, Unpooled.EMPTY_BUFFER));
+    requesterLeaseHandler.receive(leaseFrame(500_000, 2, Unpooled.EMPTY_BUFFER));
 
     Assertions.assertThat(rSocketRequester.availability()).isCloseTo(1.0, offset(1e-2));
 
     Flux.from(interaction.apply(rSocketRequester))
-        .take(Duration.ofMillis(500))
+        .take(Duration.ofMillis(10000))
         .as(StepVerifier::create)
         .expectComplete()
-        .verify(Duration.ofSeconds(5));
+        .verify(Duration.ofSeconds(50));
     Assertions.assertThat(rSocketRequester.availability()).isCloseTo(0.5, offset(1e-2));
   }
 
@@ -316,6 +317,8 @@ class RSocketLeaseTest {
     Assertions.assertThat(receivedLease.getTimeToLiveMillis()).isEqualTo(ttl);
     Assertions.assertThat(receivedLease.getStartingAllowedRequests()).isEqualTo(numberOfRequests);
     Assertions.assertThat(receivedLease.getMetadata().toString(utf8)).isEqualTo(metadataContent);
+
+    ReferenceCountUtil.safeRelease(leaseFrame);
   }
 
   ByteBuf leaseFrame(int ttl, int requests, ByteBuf metadata) {

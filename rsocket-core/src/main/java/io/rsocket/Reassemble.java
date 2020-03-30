@@ -8,5 +8,5 @@ public interface Reassemble<T> extends Subscription, CoreSubscriber<T> {
 
   boolean isReassemblingNow();
 
-  void reassemble(ByteBuf dataAndMetadata, boolean hasFollows, boolean terminal);
+  void reassemble(ByteBuf followingFrame, boolean hasFollows, boolean terminal);
 }

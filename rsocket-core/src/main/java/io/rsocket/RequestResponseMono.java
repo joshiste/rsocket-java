@@ -1,5 +1,8 @@
 package io.rsocket;
 
+import static io.rsocket.fragmentation.FragmentationUtils.isFragmentable;
+import static io.rsocket.fragmentation.FragmentationUtils.isValid;
+
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.CompositeByteBuf;
@@ -8,13 +11,12 @@ import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.fragmentation.FragmentationUtils;
+import io.rsocket.fragmentation.ReassemblyUtils;
 import io.rsocket.frame.CancelFrameFlyweight;
-import io.rsocket.frame.FrameLengthFlyweight;
 import io.rsocket.frame.FrameType;
 import io.rsocket.frame.RequestResponseFrameFlyweight;
 import io.rsocket.frame.decoder.PayloadDecoder;
 import io.rsocket.internal.UnboundedProcessor;
-import java.util.Objects;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import org.reactivestreams.Subscription;
 import reactor.core.CoreSubscriber;
@@ -95,17 +97,21 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
 
   @Override
   public final void onError(Throwable cause) {
-    Objects.requireNonNull(cause, "onError cannot be null");
-
-    if (state == STATE_TERMINATED || STATE.getAndSet(this, STATE_TERMINATED) == STATE_TERMINATED) {
+    if (this.state == STATE_TERMINATED) {
       Operators.onErrorDropped(cause, currentContext());
       return;
     }
 
     final CompositeByteBuf frames = this.frames;
     this.frames = null;
+
+    if (STATE.getAndSet(this, STATE_TERMINATED) == STATE_TERMINATED) {
+      Operators.onErrorDropped(cause, currentContext());
+      return;
+    }
+
     if (frames != null && frames.refCnt() > 0) {
-      ReferenceCountUtil.safeRelease(frames);
+      frames.release();
     }
 
     this.activeSubscriber.remove(this.streamId, this);
@@ -117,7 +123,9 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
   public final void onNext(@Nullable Payload value) {
     if (this.state == STATE_TERMINATED
         || STATE.getAndSet(this, STATE_TERMINATED) == STATE_TERMINATED) {
-      ReferenceCountUtil.safeRelease(value);
+      if (value != null) {
+        value.release();
+      }
       return;
     }
 
@@ -140,12 +148,14 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
           && STATE.compareAndSet(this, STATE_UNSUBSCRIBED, STATE_SUBSCRIBED)) {
         this.actual = actual;
 
-        if (this.mtu == 0
-            && ((p.data().readableBytes() + (p.hasMetadata() ? p.metadata().readableBytes() : 0))
-                    & ~FrameLengthFlyweight.FRAME_LENGTH_MASK)
-                != 0) {
+        final int mtu = this.mtu;
+        final boolean hasMetadata = p.hasMetadata();
+        final ByteBuf data = p.data();
+        final ByteBuf metadata = p.metadata();
+
+        if (hasMetadata ? !isValid(mtu, data, metadata) : !isValid(mtu, data)) {
           Operators.error(actual, new IllegalArgumentException("Too Big Payload size"));
-          ReferenceCountUtil.safeRelease(p);
+          p.release();
           return;
         }
 
@@ -166,6 +176,7 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
     if (Operators.validate(n)
         && this.state == STATE_SUBSCRIBED
         && STATE.compareAndSet(this, STATE_SUBSCRIBED, STATE_REQUESTED)) {
+
       final Throwable throwable = this.parent.checkAvailable();
       if (throwable != null) {
         this.state = STATE_TERMINATED;
@@ -181,14 +192,15 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
 
       try {
         final boolean hasMetadata = p.hasMetadata();
-        final ByteBuf slicedData = p.data().retainedSlice();
+        final ByteBuf data = p.data();
+        final ByteBuf metadata = p.metadata();
         final int streamId = this.streamIdSupplier.nextStreamId(as);
 
         this.streamId = streamId;
 
-        if (mtu > 0) {
-          final ByteBuf slicedMetadata =
-              hasMetadata ? p.metadata().retainedSlice() : Unpooled.EMPTY_BUFFER;
+        if (hasMetadata ? isFragmentable(mtu, data, metadata) : isFragmentable(mtu, data)) {
+          final ByteBuf slicedData = data.slice();
+          final ByteBuf slicedMetadata = hasMetadata ? metadata.slice() : Unpooled.EMPTY_BUFFER;
           final ByteBuf first =
               FragmentationUtils.encodeFirstFragment(
                   allocator, mtu, FrameType.REQUEST_RESPONSE, streamId, slicedMetadata, slicedData);
@@ -203,14 +215,17 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
             sender.onNext(following);
           }
         } else {
-          final ByteBuf slicedMetadata = hasMetadata ? p.metadata().retainedSlice() : null;
+          final ByteBuf slicedRetainedData = data.retainedSlice();
+          final ByteBuf slicedRetainedMetadata = hasMetadata ? metadata.retainedSlice() : null;
           final ByteBuf requestFrame =
               RequestResponseFrameFlyweight.encode(
-                  allocator, streamId, false, slicedMetadata, slicedData);
+                  allocator, streamId, false, slicedRetainedMetadata, slicedRetainedData);
 
           as.put(streamId, this);
           sender.onNext(requestFrame);
         }
+
+        p.release();
       } catch (Throwable e) {
         this.state = STATE_TERMINATED;
 
@@ -231,18 +246,22 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
   @Override
   public final void cancel() {
     int state = this.state;
-    if (state != STATE_TERMINATED && STATE.getAndSet(this, STATE_TERMINATED) != STATE_TERMINATED) {
-      if (state == STATE_SUBSCRIBED) {
-        ReferenceCountUtil.safeRelease(this.payload);
-      } else {
-        final int streamId = this.streamId;
+    if (state == STATE_TERMINATED) {
+      return;
+    }
 
-        final CompositeByteBuf frames = this.frames;
-        this.frames = null;
-        if (frames.refCnt() > 0) {
-          ReferenceCountUtil.safeRelease(frames);
+    final CompositeByteBuf frames = this.frames;
+    this.frames = null;
+
+    if (STATE.getAndSet(this, STATE_TERMINATED) != STATE_TERMINATED) {
+      if (state == STATE_SUBSCRIBED) {
+        this.payload.release();
+      } else {
+        if (frames != null && frames.refCnt() > 0) {
+          frames.release();
         }
 
+        final int streamId = this.streamId;
         this.activeSubscriber.remove(streamId, this);
         this.sendProcessor.onNext(CancelFrameFlyweight.encode(this.allocator, streamId));
       }
@@ -255,25 +274,37 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
   }
 
   @Override
-  public void reassemble(ByteBuf dataAndMetadata, boolean hasFollows, boolean terminal) {
-    final CompositeByteBuf frames = this.frames;
+  public void reassemble(ByteBuf followingFrame, boolean hasFollows, boolean terminal) {
+    if (this.state == STATE_TERMINATED) {
+      return;
+    }
+
+    CompositeByteBuf frames = this.frames;
 
     if (frames == null) {
-      this.frames = this.allocator.compositeBuffer().addComponent(true, dataAndMetadata);
+      frames = ReassemblyUtils.addFollowingFrame(this.allocator.compositeBuffer(), followingFrame);
+      this.frames = frames;
+      if (this.state == STATE_TERMINATED) {
+        this.frames = null;
+        ReferenceCountUtil.safeRelease(frames);
+      }
       return;
     } else {
-      frames.addComponent(true, dataAndMetadata);
+      frames = ReassemblyUtils.addFollowingFrame(frames, followingFrame);
     }
 
     if (!hasFollows) {
       this.frames = null;
       try {
         this.onNext(this.payloadDecoder.apply(frames));
-        ReferenceCountUtil.safeRelease(frames);
+        frames.release();
       } catch (Throwable t) {
         ReferenceCountUtil.safeRelease(frames);
         Exceptions.throwIfFatal(t);
-        this.onError(t);
+        // sends cancel frame to prevent any further frames
+        this.cancel();
+        // terminates downstream
+        this.actual.onError(t);
       }
     }
   }

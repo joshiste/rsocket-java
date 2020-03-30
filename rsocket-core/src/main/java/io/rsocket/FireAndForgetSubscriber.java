@@ -5,6 +5,7 @@ import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.CompositeByteBuf;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
+import io.rsocket.fragmentation.ReassemblyUtils;
 import io.rsocket.frame.decoder.PayloadDecoder;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.function.Consumer;
@@ -57,7 +58,7 @@ final class FireAndForgetSubscriber implements CoreSubscriber<Void>, Reassemble<
     this.activeStreams = activeStreams;
     this.handler = handler;
 
-    this.frames = allocator.compositeBuffer().addComponent(true, firstFrame);
+    this.frames = ReassemblyUtils.addFollowingFrame(allocator.compositeBuffer(), firstFrame);
   }
 
   @Override
@@ -70,11 +71,6 @@ final class FireAndForgetSubscriber implements CoreSubscriber<Void>, Reassemble<
 
   @Override
   public void onError(Throwable t) {
-    final CompositeByteBuf frames = this.frames;
-    if (frames != null && frames.refCnt() > 0) {
-      ReferenceCountUtil.safeRelease(frames);
-    }
-
     this.errorConsumer.accept(t);
     Operators.onErrorDropped(t, Context.empty());
   }
@@ -88,18 +84,18 @@ final class FireAndForgetSubscriber implements CoreSubscriber<Void>, Reassemble<
   }
 
   @Override
-  public void reassemble(ByteBuf dataAndMetadata, boolean hasFollows, boolean terminal) {
-    if (state == STATE_TERMINATED) {
-      ReferenceCountUtil.safeRelease(dataAndMetadata);
+  public void reassemble(ByteBuf followingFrame, boolean hasFollows, boolean terminal) {
+    if (this.state == STATE_TERMINATED) {
+      return;
     }
 
-    final CompositeByteBuf frames = this.frames.addComponent(true, dataAndMetadata);
+    final CompositeByteBuf frames = ReassemblyUtils.addFollowingFrame(this.frames, followingFrame);
 
     if (!hasFollows) {
       this.activeStreams.remove(this.streamId, this);
       try {
         Mono<Void> source = this.handler.fireAndForget(this.payloadDecoder.apply(frames));
-        ReferenceCountUtil.safeRelease(frames);
+        frames.release();
         source.subscribe(this);
       } catch (Throwable t) {
         ReferenceCountUtil.safeRelease(frames);
@@ -119,8 +115,11 @@ final class FireAndForgetSubscriber implements CoreSubscriber<Void>, Reassemble<
     }
 
     final CompositeByteBuf frames = this.frames;
-    if (frames != null && frames.refCnt() > 0) {
-      ReferenceCountUtil.safeRelease(frames);
+    if (frames != null) {
+      this.activeStreams.remove(this.streamId, this);
+      if (frames.refCnt() > 0) {
+        frames.release();
+      }
     }
   }
 }

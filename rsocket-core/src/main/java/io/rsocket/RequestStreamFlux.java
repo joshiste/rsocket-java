@@ -1,5 +1,8 @@
 package io.rsocket;
 
+import static io.rsocket.fragmentation.FragmentationUtils.isFragmentable;
+import static io.rsocket.fragmentation.FragmentationUtils.isValid;
+
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.CompositeByteBuf;
@@ -8,8 +11,8 @@ import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.fragmentation.FragmentationUtils;
+import io.rsocket.fragmentation.ReassemblyUtils;
 import io.rsocket.frame.CancelFrameFlyweight;
-import io.rsocket.frame.FrameLengthFlyweight;
 import io.rsocket.frame.FrameType;
 import io.rsocket.frame.RequestNFrameFlyweight;
 import io.rsocket.frame.RequestStreamFrameFlyweight;
@@ -49,6 +52,7 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
   int streamId;
   CoreSubscriber<? super Payload> actual;
   CompositeByteBuf frames;
+  boolean done;
 
   RequestStreamFlux(
       ByteBufAllocator allocator,
@@ -91,8 +95,13 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
 
   @Override
   public final void onComplete() {
-    if (this.requested == STATE_TERMINATED
-        || REQUESTED.getAndSet(this, STATE_TERMINATED) == STATE_TERMINATED) {
+    if (this.requested == STATE_TERMINATED) {
+      return;
+    }
+
+    this.done = true;
+
+    if (REQUESTED.getAndSet(this, STATE_TERMINATED) == STATE_TERMINATED) {
       return;
     }
 
@@ -103,16 +112,22 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
 
   @Override
   public final void onError(Throwable cause) {
-    if (this.requested == STATE_TERMINATED
-        || REQUESTED.getAndSet(this, STATE_TERMINATED) == STATE_TERMINATED) {
+    if (this.requested == STATE_TERMINATED) {
       Operators.onErrorDropped(cause, currentContext());
       return;
     }
 
     final CompositeByteBuf frames = this.frames;
     this.frames = null;
+    this.done = true;
+
+    if (REQUESTED.getAndSet(this, STATE_TERMINATED) == STATE_TERMINATED) {
+      Operators.onErrorDropped(cause, currentContext());
+      return;
+    }
+
     if (frames != null && frames.refCnt() > 0) {
-      ReferenceCountUtil.safeRelease(frames);
+      frames.release();
     }
 
     this.activeSubscribers.remove(this.streamId, this);
@@ -121,13 +136,13 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
   }
 
   @Override
-  public final void onNext(Payload value) {
+  public final void onNext(Payload p) {
     if (this.requested == STATE_TERMINATED) {
-      ReferenceCountUtil.safeRelease(value);
+      p.release();
       return;
     }
 
-    this.actual.onNext(value);
+    this.actual.onNext(p);
   }
 
   @Override
@@ -139,12 +154,14 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
           && REQUESTED.compareAndSet(this, STATE_UNSUBSCRIBED, STATE_SUBSCRIBED)) {
         this.actual = actual;
 
-        if (this.mtu == 0
-            && ((p.data().readableBytes() + (p.hasMetadata() ? p.metadata().readableBytes() : 0))
-                    & ~FrameLengthFlyweight.FRAME_LENGTH_MASK)
-                != 0) {
+        final int mtu = this.mtu;
+        final boolean hasMetadata = p.hasMetadata();
+        final ByteBuf metadata = p.metadata();
+        final ByteBuf data = p.data();
+
+        if (hasMetadata ? !isValid(mtu, data, metadata) : !isValid(mtu, data)) {
           Operators.error(actual, new IllegalArgumentException("Too Big Payload size"));
-          ReferenceCountUtil.safeRelease(p);
+          p.release();
           return;
         }
 
@@ -217,14 +234,15 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
 
         try {
           final boolean hasMetadata = p.hasMetadata();
-          final ByteBuf slicedData = p.data().retainedSlice();
+          final ByteBuf metadata = p.metadata();
+          final ByteBuf data = p.data();
 
           streamId = this.streamIdSupplier.nextStreamId(as);
           this.streamId = streamId;
 
-          if (mtu > 0) {
-            final ByteBuf slicedMetadata =
-                hasMetadata ? p.metadata().retainedSlice() : Unpooled.EMPTY_BUFFER;
+          if (hasMetadata ? isFragmentable(mtu, data, metadata) : isFragmentable(mtu, data)) {
+            final ByteBuf slicedData = data.slice();
+            final ByteBuf slicedMetadata = hasMetadata ? metadata.slice() : Unpooled.EMPTY_BUFFER;
 
             final ByteBuf first =
                 FragmentationUtils.encodeFirstFragment(
@@ -246,7 +264,8 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
               sender.onNext(following);
             }
           } else {
-            final ByteBuf slicedMetadata = hasMetadata ? p.metadata().retainedSlice() : null;
+            final ByteBuf retainedSlicedData = data.retainedSlice();
+            final ByteBuf retainedSlicedMetadata = hasMetadata ? metadata.retainedSlice() : null;
 
             final ByteBuf requestFrame =
                 RequestStreamFrameFlyweight.encode(
@@ -254,14 +273,14 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
                     streamId,
                     false,
                     (int) (nextRequested & Integer.MAX_VALUE),
-                    slicedMetadata,
-                    slicedData);
+                    retainedSlicedMetadata,
+                    retainedSlicedData);
 
             as.put(streamId, this);
             sender.onNext(requestFrame);
           }
 
-          ReferenceCountUtil.safeRelease(p);
+          p.release();
         } catch (Throwable e) {
           this.requested = STATE_TERMINATED;
 
@@ -314,8 +333,11 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
       }
 
       if (nextRequested == STATE_TERMINATED) {
-        final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
-        sender.onNext(cancelFrame);
+        // if terminated because of cancellation
+        if (!this.done) {
+          final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
+          sender.onNext(cancelFrame);
+        }
 
         return;
       }
@@ -328,22 +350,27 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
 
   @Override
   public final void cancel() {
+    if (this.requested == STATE_TERMINATED) {
+      return;
+    }
+
+    final CompositeByteBuf frames = this.frames;
+    this.frames = null;
+
     final long state = REQUESTED.getAndSet(this, STATE_TERMINATED);
-    if (state != STATE_TERMINATED && state <= 0) {
+    if (state != STATE_TERMINATED) {
+      final int streamId = this.streamId;
+      this.activeSubscribers.remove(streamId, this);
+
       if (state == STATE_SUBSCRIBED) {
         // no need to send anything, since the first request has not happened
-        ReferenceCountUtil.safeRelease(this.payload);
-      } else {
-        final int streamId = this.streamId;
-        final ByteBuf cancelFrame = CancelFrameFlyweight.encode(this.allocator, streamId);
-
-        final CompositeByteBuf frames = this.frames;
-        this.frames = null;
-        if (frames.refCnt() > 0) {
-          ReferenceCountUtil.safeRelease(frames);
+        this.payload.release();
+      } else if (state == 0 || state == STATE_REQUESTED_MAX) {
+        if (frames != null && frames.refCnt() > 0) {
+          frames.release();
         }
 
-        this.activeSubscribers.remove(streamId, this);
+        final ByteBuf cancelFrame = CancelFrameFlyweight.encode(this.allocator, streamId);
         this.sendProcessor.onNext(cancelFrame);
       }
     }
@@ -355,21 +382,31 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
   }
 
   @Override
-  public void reassemble(ByteBuf dataAndMetadata, boolean hasFollows, boolean terminal) {
-    final CompositeByteBuf frames = this.frames;
+  public void reassemble(ByteBuf followingFrame, boolean hasFollows, boolean terminal) {
+    if (this.requested == STATE_TERMINATED) {
+      return;
+    }
+
+    CompositeByteBuf frames = this.frames;
 
     if (frames == null) {
-      this.frames = this.allocator.compositeBuffer().addComponent(true, dataAndMetadata);
+      frames = ReassemblyUtils.addFollowingFrame(this.allocator.compositeBuffer(), followingFrame);
+      this.frames = frames;
+      if (this.requested == STATE_TERMINATED) {
+        this.frames = null;
+        ReferenceCountUtil.safeRelease(frames);
+        return;
+      }
       return;
     } else {
-      frames.addComponent(true, dataAndMetadata);
+      frames = ReassemblyUtils.addFollowingFrame(frames, followingFrame);
     }
 
     if (!hasFollows) {
       this.frames = null;
       try {
         this.onNext(this.payloadDecoder.apply(frames));
-        ReferenceCountUtil.safeRelease(frames);
+        frames.release();
 
         if (terminal) {
           this.onComplete();

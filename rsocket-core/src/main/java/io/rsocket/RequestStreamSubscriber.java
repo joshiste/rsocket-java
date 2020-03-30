@@ -1,5 +1,8 @@
 package io.rsocket;
 
+import static io.rsocket.fragmentation.FragmentationUtils.isFragmentable;
+import static io.rsocket.fragmentation.FragmentationUtils.isValid;
+
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.CompositeByteBuf;
@@ -8,8 +11,8 @@ import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.fragmentation.FragmentationUtils;
+import io.rsocket.fragmentation.ReassemblyUtils;
 import io.rsocket.frame.ErrorFrameFlyweight;
-import io.rsocket.frame.FrameLengthFlyweight;
 import io.rsocket.frame.FrameType;
 import io.rsocket.frame.PayloadFrameFlyweight;
 import io.rsocket.frame.decoder.PayloadDecoder;
@@ -66,7 +69,7 @@ public class RequestStreamSubscriber implements Reassemble<Payload> {
     this.sendProcessor = sendProcessor;
     this.payloadDecoder = payloadDecoder;
     this.handler = handler;
-    this.frames = allocator.compositeBuffer().addComponent(true, firstFrame);
+    this.frames = ReassemblyUtils.addFollowingFrame(allocator.compositeBuffer(), firstFrame);
   }
 
   public RequestStreamSubscriber(
@@ -128,6 +131,7 @@ public class RequestStreamSubscriber implements Reassemble<Payload> {
     final UnboundedProcessor<ByteBuf> sender = this.sendProcessor;
     final ByteBufAllocator allocator = this.allocator;
 
+    // this in payloads from user so need to check
     if (p.refCnt() <= 0) {
       this.cancel();
 
@@ -135,16 +139,30 @@ public class RequestStreamSubscriber implements Reassemble<Payload> {
       final ByteBuf errorFrame = ErrorFrameFlyweight.encode(allocator, streamId, t);
       this.errorConsumer.accept(t);
       sender.onNext(errorFrame);
+      return;
     }
 
     try {
       final int mtu = this.mtu;
       final boolean hasMetadata = p.hasMetadata();
+      final ByteBuf data = p.data();
+      final ByteBuf metadata = p.metadata();
 
-      if (mtu > 0) {
-        final ByteBuf slicedData = p.data().retainedSlice();
-        final ByteBuf slicedMetadata =
-            hasMetadata ? p.metadata().retainedSlice() : Unpooled.EMPTY_BUFFER;
+      if (hasMetadata ? !isValid(mtu, data, metadata) : !isValid(mtu, data)) {
+        p.release();
+        this.cancel();
+
+        final Throwable t = new IllegalArgumentException("Too Big Payload size");
+        final ByteBuf errorFrame = ErrorFrameFlyweight.encode(allocator, streamId, t);
+        this.errorConsumer.accept(t);
+        sender.onNext(errorFrame);
+
+        return;
+      }
+
+      if (hasMetadata ? isFragmentable(mtu, data, metadata) : isFragmentable(mtu, data)) {
+        final ByteBuf slicedData = data.slice();
+        final ByteBuf slicedMetadata = hasMetadata ? metadata.slice() : Unpooled.EMPTY_BUFFER;
 
         final ByteBuf first =
             FragmentationUtils.encodeFirstFragment(
@@ -160,34 +178,25 @@ public class RequestStreamSubscriber implements Reassemble<Payload> {
         }
 
       } else {
-        final ByteBuf data = p.data();
-        final ByteBuf metadata = p.metadata();
+        final ByteBuf retainedSlicedData = data.retainedSlice();
+        final ByteBuf retainedSlicedMetadata = hasMetadata ? metadata.retainedSlice() : null;
 
-        if (((data.readableBytes() + (hasMetadata ? metadata.readableBytes() : 0))
-                & ~FrameLengthFlyweight.FRAME_LENGTH_MASK)
-            != 0) {
-          this.cancel();
-
-          final Throwable t = new IllegalArgumentException("Too Big Payload size");
-          final ByteBuf errorFrame = ErrorFrameFlyweight.encode(allocator, streamId, t);
-          this.errorConsumer.accept(t);
-          sender.onNext(errorFrame);
-
-        } else {
-          final ByteBuf slicedData = data.retainedSlice();
-          final ByteBuf slicedMetadata = hasMetadata ? metadata.retainedSlice() : null;
-
-          final ByteBuf nextFrame =
-              PayloadFrameFlyweight.encode(
-                  allocator, streamId, false, true, true, slicedMetadata, slicedData);
-          sender.onNext(nextFrame);
-        }
+        final ByteBuf nextFrame =
+            PayloadFrameFlyweight.encode(
+                allocator,
+                streamId,
+                false,
+                false,
+                true,
+                retainedSlicedMetadata,
+                retainedSlicedData);
+        sender.onNext(nextFrame);
       }
 
-      ReferenceCountUtil.safeRelease(p);
+      p.release();
     } catch (Throwable t) {
-      this.cancel();
       ReferenceCountUtil.safeRelease(p);
+      this.cancel();
       Exceptions.throwIfFatal(t);
 
       this.errorConsumer.accept(t);
@@ -208,7 +217,7 @@ public class RequestStreamSubscriber implements Reassemble<Payload> {
 
     final CompositeByteBuf frames = this.frames;
     if (frames != null && frames.refCnt() > 0) {
-      ReferenceCountUtil.safeRelease(frames);
+      frames.release();
     }
 
     final int streamId = this.streamId;
@@ -266,11 +275,12 @@ public class RequestStreamSubscriber implements Reassemble<Payload> {
 
     final CompositeByteBuf frames = this.frames;
     if (frames != null && frames.refCnt() > 0) {
-      ReferenceCountUtil.safeRelease(frames);
+      frames.release();
     }
 
+    this.activeStreams.remove(this.streamId, this);
+
     if (state <= STATE_SUBSCRIBED) {
-      this.activeStreams.remove(this.streamId, this);
       this.s.cancel();
     }
   }
@@ -281,17 +291,27 @@ public class RequestStreamSubscriber implements Reassemble<Payload> {
   }
 
   @Override
-  public void reassemble(ByteBuf dataAndMetadata, boolean hasFollows, boolean terminal) {
-    final CompositeByteBuf frames = this.frames.addComponent(true, dataAndMetadata);
+  public void reassemble(ByteBuf followingFrame, boolean hasFollows, boolean terminal) {
+    if (this.requested == STATE_TERMINATED) {
+      return;
+    }
+
+    final CompositeByteBuf frames = ReassemblyUtils.addFollowingFrame(this.frames, followingFrame);
 
     if (!hasFollows) {
       try {
         Flux<Payload> source = this.handler.requestStream(this.payloadDecoder.apply(frames));
-        ReferenceCountUtil.safeRelease(frames);
+        frames.release();
         source.subscribe(this);
       } catch (Throwable t) {
         ReferenceCountUtil.safeRelease(frames);
         Exceptions.throwIfFatal(t);
+
+        final long requested = this.requested;
+        if (requested == STATE_SUBSCRIBED || requested == STATE_SUBSCRIBED_RECEIVED_MAX) {
+          this.s.cancel();
+        }
+
         this.onError(t);
       }
     }

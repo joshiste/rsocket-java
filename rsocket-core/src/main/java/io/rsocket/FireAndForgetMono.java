@@ -1,5 +1,8 @@
 package io.rsocket;
 
+import static io.rsocket.fragmentation.FragmentationUtils.isFragmentable;
+import static io.rsocket.fragmentation.FragmentationUtils.isValid;
+
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
@@ -7,7 +10,6 @@ import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.fragmentation.FragmentationUtils;
-import io.rsocket.frame.FrameLengthFlyweight;
 import io.rsocket.frame.FrameType;
 import io.rsocket.frame.RequestFireAndForgetFrameFlyweight;
 import io.rsocket.internal.UnboundedProcessor;
@@ -63,13 +65,10 @@ final class FireAndForgetMono extends Mono<Void> implements Scannable {
         try {
           final boolean hasMetadata = p.hasMetadata();
           final ByteBuf data = p.data();
-          final ByteBuf metadata = hasMetadata ? p.metadata() : null;
+          final ByteBuf metadata = p.metadata();
           final int mtu = this.mtu;
 
-          if (mtu == 0
-              && ((data.readableBytes() + (hasMetadata ? metadata.readableBytes() : 0))
-                      & ~FrameLengthFlyweight.FRAME_LENGTH_MASK)
-                  != 0) {
+          if (hasMetadata ? !isValid(mtu, data, metadata) : !isValid(mtu, data)) {
             Operators.error(actual, new IllegalArgumentException("Too Big Payload size"));
           } else {
             final Throwable throwable = parent.checkAvailable();
@@ -79,11 +78,11 @@ final class FireAndForgetMono extends Mono<Void> implements Scannable {
               final int streamId = this.streamIdSupplier.nextStreamId(this.activeStreams);
               final UnboundedProcessor<ByteBuf> sender = this.sendProcessor;
               final ByteBufAllocator allocator = this.allocator;
-              final ByteBuf slicedData = data.retainedSlice();
 
-              if (mtu > 0) {
+              if (hasMetadata ? isFragmentable(mtu, data, metadata) : isFragmentable(mtu, data)) {
+                final ByteBuf slicedData = data.slice();
                 final ByteBuf slicedMetadata =
-                    hasMetadata ? metadata.retainedSlice() : Unpooled.EMPTY_BUFFER;
+                    hasMetadata ? metadata.slice() : Unpooled.EMPTY_BUFFER;
 
                 final ByteBuf first =
                     FragmentationUtils.encodeFirstFragment(
@@ -102,11 +101,13 @@ final class FireAndForgetMono extends Mono<Void> implements Scannable {
                   sender.onNext(following);
                 }
               } else {
-                final ByteBuf slicedMetadata = hasMetadata ? metadata.retainedSlice() : null;
+                final ByteBuf slicedRetainedData = data.retainedSlice();
+                final ByteBuf slicedRetainedMetadata =
+                    hasMetadata ? metadata.retainedSlice() : null;
 
                 final ByteBuf requestFrame =
                     RequestFireAndForgetFrameFlyweight.encode(
-                        allocator, streamId, false, slicedMetadata, slicedData);
+                        allocator, streamId, false, slicedRetainedMetadata, slicedRetainedData);
                 sender.onNext(requestFrame);
               }
 
@@ -122,7 +123,7 @@ final class FireAndForgetMono extends Mono<Void> implements Scannable {
             new IllegalStateException("UnicastFireAndForgetMono allows only a single Subscriber"));
       }
 
-      ReferenceCountUtil.safeRelease(p);
+      p.release();
     } else {
       Operators.error(actual, new IllegalReferenceCountException(0));
     }
