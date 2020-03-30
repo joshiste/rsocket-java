@@ -16,6 +16,7 @@
 
 package io.rsocket.examples.transport.tcp.channel;
 
+import io.netty.util.ReferenceCounted;
 import io.rsocket.AbstractRSocket;
 import io.rsocket.ConnectionSetupPayload;
 import io.rsocket.Payload;
@@ -27,6 +28,8 @@ import io.rsocket.transport.local.LocalClientTransport;
 import io.rsocket.transport.local.LocalServerTransport;
 import io.rsocket.util.ByteBufPayload;
 import java.time.Duration;
+import java.util.concurrent.atomic.AtomicLong;
+
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -35,7 +38,7 @@ import reactor.core.scheduler.Schedulers;
 public final class ChannelEchoClient {
   static final Payload payload1 = ByteBufPayload.create("Hello ");
 
-  public static void main(String[] args) {
+  public static void main(String[] args) throws InterruptedException {
     RSocketFactory.receive()
         .frameDecoder(PayloadDecoder.ZERO_COPY)
         .acceptor(new SocketAcceptorImpl())
@@ -51,13 +54,25 @@ public final class ChannelEchoClient {
             .start()
             .block();
 
-    Flux.range(0, 100000000)
-        .concatMap(i -> socket.fireAndForget(payload1.retain()))
-        //        .doOnNext(p -> {
-        ////            System.out.println(p.getDataUtf8());
-        //            p.release();
-        //        })
+    AtomicLong receivedRequests = new AtomicLong();
+    AtomicLong sentRequests = new AtomicLong();
+
+    Flux.range(0, 100000)
+        .map(t -> payload1.retain())
+        .doOnRequest(receivedRequests::addAndGet)
+        .transform(socket::requestChannel)
+        .doOnRequest(sentRequests::addAndGet)
+        .map(ReferenceCounted::release)
+        .limitRate(1)
         .blockLast();
+
+    System.gc();
+    Thread.sleep(1000);
+    System.gc();
+
+    if ((sentRequests.get() - 1) != receivedRequests.get()) {
+        throw new IllegalStateException("Requested [" + sentRequests.get() + "], but received [" + receivedRequests.get() + "]");
+    }
   }
 
   private static class SocketAcceptorImpl implements SocketAcceptor {
@@ -80,7 +95,8 @@ public final class ChannelEchoClient {
 
             @Override
             public Flux<Payload> requestChannel(Publisher<Payload> payloads) {
-              return Flux.from(payloads).subscribeOn(Schedulers.single());
+              return Flux.from(payloads)
+                      .subscribeOn(Schedulers.single());
             }
           });
     }

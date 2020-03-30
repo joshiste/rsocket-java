@@ -200,7 +200,7 @@ public class RequestChannelSubscriber extends Flux<Payload> implements Reassembl
       }
 
       this.s = subscription;
-      if (REQUESTED.compareAndSet(this, state, (state & MASK_FLAGS) | MASK_REQUESTED)) {
+      if (REQUESTED.compareAndSet(this, state, state & MASK_FLAGS)) {
         subscription.request(requested == REQUEST_MAX_VALUE ? Long.MAX_VALUE : requested);
         return;
       }
@@ -668,6 +668,8 @@ public class RequestChannelSubscriber extends Flux<Payload> implements Reassembl
       }
 
       if (!hasSentFirst) {
+        // decrement first requested item immediately
+        n--;
         final CoreSubscriber<? super Payload> actual = parent.actual;
 
         actual.onNext(firstPayload);
@@ -682,9 +684,11 @@ public class RequestChannelSubscriber extends Flux<Payload> implements Reassembl
         }
       }
 
-      final ByteBuf requestNFrame =
-          RequestNFrameFlyweight.encode(this.allocator, parent.streamId, n);
-      this.sendProcessor.onNext(requestNFrame);
+      if (n > 0) {
+        final ByteBuf requestNFrame =
+                RequestNFrameFlyweight.encode(this.allocator, parent.streamId, n);
+        this.sendProcessor.onNext(requestNFrame);
+      }
     }
 
     @Override
