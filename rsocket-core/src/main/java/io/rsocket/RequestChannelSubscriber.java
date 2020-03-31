@@ -686,7 +686,7 @@ public class RequestChannelSubscriber extends Flux<Payload> implements Reassembl
 
       if (n > 0) {
         final ByteBuf requestNFrame =
-                RequestNFrameFlyweight.encode(this.allocator, parent.streamId, n);
+            RequestNFrameFlyweight.encode(this.allocator, parent.streamId, n);
         this.sendProcessor.onNext(requestNFrame);
       }
     }

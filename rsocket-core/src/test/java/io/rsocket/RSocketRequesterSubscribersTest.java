@@ -18,6 +18,7 @@ package io.rsocket;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.util.CharsetUtil;
 import io.rsocket.frame.FrameHeaderFlyweight;
 import io.rsocket.frame.FrameType;
 import io.rsocket.frame.decoder.PayloadDecoder;
@@ -116,6 +117,8 @@ class RSocketRequesterSubscribersTest {
         rSocket -> rSocket.requestResponse(DefaultPayload.create("test")),
         rSocket -> rSocket.requestStream(DefaultPayload.create("test")),
         rSocket -> rSocket.requestChannel(Mono.just(DefaultPayload.create("test"))),
-        rSocket -> rSocket.metadataPush(DefaultPayload.create("test")));
+        rSocket ->
+            rSocket.metadataPush(
+                DefaultPayload.create(new byte[0], "test".getBytes(CharsetUtil.UTF_8))));
   }
 }

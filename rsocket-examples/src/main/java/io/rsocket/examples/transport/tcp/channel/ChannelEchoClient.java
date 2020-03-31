@@ -29,7 +29,6 @@ import io.rsocket.transport.local.LocalServerTransport;
 import io.rsocket.util.ByteBufPayload;
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
-
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -71,7 +70,8 @@ public final class ChannelEchoClient {
     System.gc();
 
     if ((sentRequests.get() - 1) != receivedRequests.get()) {
-        throw new IllegalStateException("Requested [" + sentRequests.get() + "], but received [" + receivedRequests.get() + "]");
+      throw new IllegalStateException(
+          "Requested [" + sentRequests.get() + "], but received [" + receivedRequests.get() + "]");
     }
   }
 
@@ -95,8 +95,7 @@ public final class ChannelEchoClient {
 
             @Override
             public Flux<Payload> requestChannel(Publisher<Payload> payloads) {
-              return Flux.from(payloads)
-                      .subscribeOn(Schedulers.single());
+              return Flux.from(payloads).subscribeOn(Schedulers.single());
             }
           });
     }

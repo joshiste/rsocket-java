@@ -7,7 +7,6 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.netty.util.IllegalReferenceCountException;
-import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.fragmentation.FragmentationUtils;
 import io.rsocket.frame.FrameType;
@@ -138,32 +137,75 @@ final class FireAndForgetMono extends Mono<Void> implements Scannable {
   @Override
   @Nullable
   public Void block() {
-    Throwable throwable = parent.checkAvailable();
+    final Payload p = this.payload;
 
-    if (throwable == null) {
-      if (this.payload.refCnt() > 0) {
+    if (p.refCnt() > 0) {
+      if (once == 0 && ONCE.compareAndSet(this, 0, 1)) {
         try {
-          ByteBuf data = this.payload.data().retainedSlice();
-          ByteBuf metadata =
-              this.payload.hasMetadata() ? this.payload.metadata().retainedSlice() : null;
+          final boolean hasMetadata = p.hasMetadata();
+          final ByteBuf data = p.data();
+          final ByteBuf metadata = p.metadata();
+          final int mtu = this.mtu;
 
-          int streamId = this.streamIdSupplier.nextStreamId(this.activeStreams);
+          if (hasMetadata ? !isValid(mtu, data, metadata) : !isValid(mtu, data)) {
+            p.release();
+            throw new IllegalArgumentException("Too Big Payload size");
+          } else {
+            final Throwable throwable = parent.checkAvailable();
+            if (throwable != null) {
+              p.release();
+              throw throwable;
+            } else {
+              final int streamId = this.streamIdSupplier.nextStreamId(this.activeStreams);
+              final UnboundedProcessor<ByteBuf> sender = this.sendProcessor;
+              final ByteBufAllocator allocator = this.allocator;
 
-          ByteBuf requestFrame =
-              RequestFireAndForgetFrameFlyweight.encode(
-                  this.allocator, streamId, false, metadata, data);
+              if (hasMetadata ? isFragmentable(mtu, data, metadata) : isFragmentable(mtu, data)) {
+                final ByteBuf slicedData = data.slice();
+                final ByteBuf slicedMetadata =
+                    hasMetadata ? metadata.slice() : Unpooled.EMPTY_BUFFER;
 
-          this.sendProcessor.onNext(requestFrame);
-          return null;
-        } finally {
-          ReferenceCountUtil.safeRelease(this.payload);
+                final ByteBuf first =
+                    FragmentationUtils.encodeFirstFragment(
+                        allocator,
+                        mtu,
+                        FrameType.REQUEST_FNF,
+                        streamId,
+                        slicedMetadata,
+                        slicedData);
+                sender.onNext(first);
+
+                while (slicedData.isReadable() || slicedMetadata.isReadable()) {
+                  ByteBuf following =
+                      FragmentationUtils.encodeFollowsFragment(
+                          allocator, mtu, streamId, false, slicedMetadata, slicedData);
+                  sender.onNext(following);
+                }
+              } else {
+                final ByteBuf slicedRetainedData = data.retainedSlice();
+                final ByteBuf slicedRetainedMetadata =
+                    hasMetadata ? metadata.retainedSlice() : null;
+
+                final ByteBuf requestFrame =
+                    RequestFireAndForgetFrameFlyweight.encode(
+                        allocator, streamId, false, slicedRetainedMetadata, slicedRetainedData);
+                sender.onNext(requestFrame);
+              }
+
+              p.release();
+              return null;
+            }
+          }
+        } catch (Throwable e) {
+          p.release();
+          throw Exceptions.propagate(e);
         }
       } else {
-        return null;
+        p.release();
+        throw new IllegalStateException("UnicastFireAndForgetMono allows only a single Subscriber");
       }
     } else {
-      ReferenceCountUtil.safeRelease(this.payload);
-      throw Exceptions.propagate(throwable);
+      throw new IllegalReferenceCountException(0);
     }
   }
 

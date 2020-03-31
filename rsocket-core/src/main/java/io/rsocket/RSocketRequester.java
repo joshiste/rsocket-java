@@ -29,12 +29,10 @@ import io.rsocket.exceptions.Exceptions;
 import io.rsocket.frame.ErrorFrameFlyweight;
 import io.rsocket.frame.FrameHeaderFlyweight;
 import io.rsocket.frame.FrameType;
-import io.rsocket.frame.MetadataPushFrameFlyweight;
 import io.rsocket.frame.RequestNFrameFlyweight;
 import io.rsocket.frame.decoder.PayloadDecoder;
 import io.rsocket.internal.SynchronizedIntObjectHashMap;
 import io.rsocket.internal.UnboundedProcessor;
-import io.rsocket.internal.UnicastMonoEmpty;
 import io.rsocket.keepalive.KeepAliveFramesAcceptor;
 import io.rsocket.keepalive.KeepAliveHandler;
 import io.rsocket.keepalive.KeepAliveSupport;
@@ -208,20 +206,16 @@ class RSocketRequester implements RSocket, StateAware {
   }
 
   private Mono<Void> handleMetadataPush(Payload payload) {
+    return new MetadataPushMono(this.allocator, payload, this.mtu, this, this.sendProcessor);
+  }
+
+  public Throwable error() {
     Throwable err = this.terminationError;
     if (err != null) {
-      payload.release();
-      return Mono.error(err);
+      return err;
     }
 
-    return UnicastMonoEmpty.newInstance(
-        () -> {
-          ByteBuf metadataPushFrame =
-              MetadataPushFrameFlyweight.encode(allocator, payload.sliceMetadata().retain());
-          payload.release();
-
-          sendProcessor.onNextPrioritized(metadataPushFrame);
-        });
+    return null;
   }
 
   public Throwable checkAvailable() {
