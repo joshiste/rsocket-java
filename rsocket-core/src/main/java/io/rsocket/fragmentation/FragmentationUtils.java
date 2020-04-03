@@ -16,7 +16,9 @@ public class FragmentationUtils {
 
   public static boolean isValid(int mtu, ByteBuf data) {
     return mtu > 0
-        || (((FrameHeaderFlyweight.size() + data.readableBytes())
+        || (((FrameHeaderFlyweight.size()
+                    + data.readableBytes()
+                    + FrameLengthFlyweight.FRAME_LENGTH_SIZE)
                 & ~FrameLengthFlyweight.FRAME_LENGTH_MASK)
             == 0);
   }
@@ -24,6 +26,7 @@ public class FragmentationUtils {
   public static boolean isValid(int mtu, ByteBuf data, ByteBuf metadata) {
     return mtu > 0
         || (((FrameHeaderFlyweight.size()
+                    + FrameLengthFlyweight.FRAME_LENGTH_SIZE
                     + FrameHeaderFlyweight.size()
                     + data.readableBytes()
                     + metadata.readableBytes())
@@ -33,7 +36,7 @@ public class FragmentationUtils {
 
   public static boolean isFragmentable(int mtu, ByteBuf data) {
     if (mtu > 0) {
-      int remaining = mtu - FrameHeaderFlyweight.size();
+      int remaining = mtu - FrameHeaderFlyweight.size() - FrameLengthFlyweight.FRAME_LENGTH_SIZE;
 
       return remaining < data.readableBytes();
     }
@@ -43,7 +46,11 @@ public class FragmentationUtils {
 
   public static boolean isFragmentable(int mtu, ByteBuf data, ByteBuf metadata) {
     if (mtu > 0) {
-      int remaining = mtu - FrameHeaderFlyweight.size() - FrameHeaderFlyweight.size();
+      int remaining =
+          mtu
+              - FrameHeaderFlyweight.size()
+              - FrameHeaderFlyweight.size()
+              - FrameLengthFlyweight.FRAME_LENGTH_SIZE;
 
       return remaining < (metadata.readableBytes() + data.readableBytes());
     }

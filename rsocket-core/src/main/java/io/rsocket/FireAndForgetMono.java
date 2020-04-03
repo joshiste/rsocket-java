@@ -7,6 +7,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
 import io.netty.util.IllegalReferenceCountException;
+import io.netty.util.ReferenceCountUtil;
 import io.netty.util.collection.IntObjectMap;
 import io.rsocket.fragmentation.FragmentationUtils;
 import io.rsocket.frame.FrameType;
@@ -113,16 +114,16 @@ final class FireAndForgetMono extends Mono<Void> implements Scannable {
               Operators.complete(actual);
             }
           }
+
+          p.release();
         } catch (Throwable e) {
+          ReferenceCountUtil.safeRelease(p);
           Operators.error(actual, e);
         }
       } else {
         Operators.error(
-            actual,
-            new IllegalStateException("UnicastFireAndForgetMono allows only a single Subscriber"));
+            actual, new IllegalStateException("FireAndForgetMono allows only a single Subscriber"));
       }
-
-      p.release();
     } else {
       Operators.error(actual, new IllegalReferenceCountException(0));
     }
@@ -140,22 +141,22 @@ final class FireAndForgetMono extends Mono<Void> implements Scannable {
     final Payload p = this.payload;
 
     if (p.refCnt() > 0) {
-      if (once == 0 && ONCE.compareAndSet(this, 0, 1)) {
-        try {
-          final boolean hasMetadata = p.hasMetadata();
-          final ByteBuf data = p.data();
-          final ByteBuf metadata = p.metadata();
-          final int mtu = this.mtu;
+      if (this.once == 0 && ONCE.compareAndSet(this, 0, 1)) {
+        final boolean hasMetadata = p.hasMetadata();
+        final ByteBuf data = p.data();
+        final ByteBuf metadata = p.metadata();
+        final int mtu = this.mtu;
 
-          if (hasMetadata ? !isValid(mtu, data, metadata) : !isValid(mtu, data)) {
+        if (hasMetadata ? !isValid(mtu, data, metadata) : !isValid(mtu, data)) {
+          p.release();
+          throw new IllegalArgumentException("Too Big Payload size");
+        } else {
+          final Throwable throwable = parent.checkAvailable();
+          if (throwable != null) {
             p.release();
-            throw new IllegalArgumentException("Too Big Payload size");
+            throw Exceptions.propagate(throwable);
           } else {
-            final Throwable throwable = parent.checkAvailable();
-            if (throwable != null) {
-              p.release();
-              throw throwable;
-            } else {
+            try {
               final int streamId = this.streamIdSupplier.nextStreamId(this.activeStreams);
               final UnboundedProcessor<ByteBuf> sender = this.sendProcessor;
               final ByteBufAllocator allocator = this.allocator;
@@ -194,15 +195,14 @@ final class FireAndForgetMono extends Mono<Void> implements Scannable {
 
               p.release();
               return null;
+            } catch (Throwable e) {
+              ReferenceCountUtil.safeRelease(p);
+              throw Exceptions.propagate(e);
             }
           }
-        } catch (Throwable e) {
-          p.release();
-          throw Exceptions.propagate(e);
         }
       } else {
-        p.release();
-        throw new IllegalStateException("UnicastFireAndForgetMono allows only a single Subscriber");
+        throw new IllegalStateException("FireAndForgetMono allows only a single Subscriber");
       }
     } else {
       throw new IllegalReferenceCountException(0);
@@ -217,6 +217,6 @@ final class FireAndForgetMono extends Mono<Void> implements Scannable {
   @Override
   @NonNull
   public String stepName() {
-    return "source(UnicastFireAndForgetMono)";
+    return "source(FireAndForgetMono)";
   }
 }

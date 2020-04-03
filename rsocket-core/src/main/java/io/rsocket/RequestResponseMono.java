@@ -42,7 +42,8 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
   static final int STATE_UNSUBSCRIBED = 0;
   static final int STATE_SUBSCRIBED = 1;
   static final int STATE_REQUESTED = 2;
-  static final int STATE_TERMINATED = 3;
+  static final int STATE_REASSEMBLING = 3;
+  static final int STATE_TERMINATED = 4;
 
   volatile int state;
   static final AtomicIntegerFieldUpdater<RequestResponseMono> STATE =
@@ -180,6 +181,7 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
       final Throwable throwable = this.parent.checkAvailable();
       if (throwable != null) {
         this.state = STATE_TERMINATED;
+        this.payload.release();
         this.actual.onError(throwable);
         return;
       }
@@ -250,15 +252,15 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
       return;
     }
 
-    final CompositeByteBuf frames = this.frames;
-    this.frames = null;
-
     if (STATE.getAndSet(this, STATE_TERMINATED) != STATE_TERMINATED) {
       if (state == STATE_SUBSCRIBED) {
         this.payload.release();
       } else {
+
+        final CompositeByteBuf frames = this.frames;
+        this.frames = null;
         if (frames != null && frames.refCnt() > 0) {
-          frames.release();
+          ReferenceCountUtil.safeRelease(frames);
         }
 
         final int streamId = this.streamId;
@@ -284,11 +286,18 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
     if (frames == null) {
       frames = ReassemblyUtils.addFollowingFrame(this.allocator.compositeBuffer(), followingFrame);
       this.frames = frames;
-      if (this.state == STATE_TERMINATED) {
-        this.frames = null;
-        ReferenceCountUtil.safeRelease(frames);
+      for (; ; ) {
+        int state = this.state;
+
+        if (state == STATE_TERMINATED) {
+          this.frames = null;
+          ReferenceCountUtil.safeRelease(frames);
+        }
+
+        if (STATE.compareAndSet(this, state, STATE_REASSEMBLING)) {
+          return;
+        }
       }
-      return;
     } else {
       frames = ReassemblyUtils.addFollowingFrame(frames, followingFrame);
     }

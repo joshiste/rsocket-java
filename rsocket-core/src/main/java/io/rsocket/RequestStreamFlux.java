@@ -223,6 +223,7 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
       if (currentRequested == STATE_SUBSCRIBED) {
         final Throwable throwable = this.parent.checkAvailable();
         if (throwable != null) {
+          this.payload.release();
           this.requested = STATE_TERMINATED;
           this.actual.onError(throwable);
           return;
